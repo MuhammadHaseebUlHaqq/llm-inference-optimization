@@ -6,6 +6,10 @@ edited and re-rendered instead of rewritten.
 | source | rendered to |
 | --- | --- |
 | `week1_day1-4_condensed.html` | `WEEK1_DAY1-4_condensed.pdf` (10 pages) |
+| `week1_day5-8_condensed.html` | `WEEK1_DAY5-8_condensed.pdf` (9 pages) |
+
+Measured numbers in these documents come from `results/*.csv`. Where a CSV and a
+prose doc in `docs/` disagree, the CSV wins.
 
 Render with headless Chrome, from the repo root:
 

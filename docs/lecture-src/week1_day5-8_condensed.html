@@ -1,0 +1,464 @@
+<meta charset="utf-8">
+<title>Week 1, Days 5-8: Roofline, Inference Arithmetic, and PagedAttention</title>
+<style>
+@page { size: A4; margin: 14mm 15mm 14mm 15mm; }
+* { box-sizing: border-box; }
+body { font-family: "Charter", "Georgia", serif; font-size: 10.2pt; line-height: 1.38; color: #16181d; }
+h1 { font-size: 19pt; margin: 0 0 2px 0; line-height: 1.15; }
+h2 { font-size: 13pt; margin: 16px 0 6px 0; padding: 4px 0 4px 8px;
+     border-left: 4px solid #2b5fa8; background: #eef2f8; page-break-after: avoid; }
+h3 { font-size: 11pt; margin: 11px 0 4px 0; color: #1c3f70; page-break-after: avoid; }
+p { margin: 5px 0; }
+ul, ol { margin: 5px 0 5px 0; padding-left: 19px; }
+li { margin: 2px 0; }
+code, pre { font-family: "Consolas", "DejaVu Sans Mono", monospace; }
+code { font-size: 9pt; background: #f2f3f5; padding: 0 2px; border-radius: 2px; }
+pre { font-size: 8.6pt; background: #f7f8fa; border: 1px solid #dde1e8; border-radius: 3px;
+      padding: 6px 8px; margin: 6px 0; line-height: 1.32; white-space: pre-wrap;
+      overflow-x: auto; page-break-inside: avoid; }
+table { border-collapse: collapse; width: 100%; margin: 6px 0; font-size: 9.2pt;
+        page-break-inside: avoid; }
+th, td { border: 1px solid #ccd2dc; padding: 3px 6px; text-align: left; vertical-align: top; }
+th { background: #eef2f8; font-weight: 600; }
+.sub { color: #55606f; font-size: 10pt; margin: 0 0 10px 0; }
+.ex { border: 1px solid #b9cbe4; background: #f4f8fd; border-radius: 3px;
+      padding: 6px 9px; margin: 7px 0; page-break-inside: avoid; }
+.ex .lbl { font-family: Consolas, monospace; font-size: 8.4pt; font-weight: 700;
+           letter-spacing: .04em; color: #2b5fa8; text-transform: uppercase; display: block;
+           margin-bottom: 3px; }
+.key { border-left: 3px solid #c58b00; background: #fdf7e8; padding: 5px 9px; margin: 7px 0;
+       page-break-inside: avoid; }
+.key b { color: #8a6100; }
+a { color: #2b5fa8; text-decoration: none; }
+.links { font-size: 8.9pt; color: #55606f; margin: 5px 0 0 0; }
+.day { page-break-before: always; }
+.tight li { margin: 1px 0; }
+hr { border: 0; border-top: 1px solid #dde1e8; margin: 14px 0 0 0; }
+.small { font-size: 9pt; color: #55606f; }
+</style>
+
+<h1>Week 1, Days 5-8</h1>
+<p class="sub">The roofline, inference arithmetic, and the KV cache as a serving engine sees it.
+Continues the Days 1-4 notes. Same model and card throughout: Qwen2.5-1.5B, fp16, one RTX 3060 12GB.</p>
+
+<table>
+<tr><th>Day</th><th>Topic</th><th>The one thing you must be able to derive</th></tr>
+<tr><td>5</td><td>Roofline and arithmetic intensity</td><td>Decode intensity is exactly 1 FLOP/byte,
+and the ridge is 142</td></tr>
+<tr><td>6</td><td>Inference arithmetic</td><td>The parameter count summing to 1,543,714,304, and
+MBU vs MFU</td></tr>
+<tr><td>7</td><td>Buffer and rehearsal</td><td>Nothing new. Say the four anchor answers out loud</td></tr>
+<tr><td>8</td><td>PagedAttention</td><td>The three wastes, and which one actually killed your run</td></tr>
+</table>
+
+<div class="key"><b>Correction carried in from Days 1-4.</b> Two numbers in the older
+<code>docs/*.md</code> files are stale, and the CSVs are the authority. HF prefill is <b>122 ms
+(4205 tok/s)</b>, not 137 ms, and HF decode settled at <b>28.1 tok/s</b>, not 18-23. So the
+HF-to-vLLM decode gap is <b>2.84x</b>, not the ~4x written in the older prose. The Days 1-4 PDF has
+been re-rendered with these corrected.</div>
+
+<!-- ===================== DAY 5 ===================== -->
+<h2>Day 5 &nbsp;&middot;&nbsp; The roofline, and where your two phases sit on it</h2>
+
+<h3>5.1 The model, in two lines</h3>
+<p>Any piece of work on a GPU is limited by one of two things: how fast the chip can do arithmetic, or
+how fast it can fetch the data to do arithmetic on. Plot achievable performance against arithmetic
+intensity and you get two straight lines and a corner.</p>
+<pre>attainable FLOP/s = min( peak FLOP/s ,  bandwidth x arithmetic intensity )
+
+arithmetic intensity (AI) = FLOPs performed / bytes moved from memory
+
+          FLOP/s
+             |            ___________ peak compute (51 TFLOPS)
+             |          /
+             |        /   &lt;- the sloped part is bandwidth x AI
+             |      /
+             |____/________________________ AI (FLOP/byte)
+                 142 = ridge point</pre>
+<p>Left of the ridge you are memory-bound and the only lever is moving fewer bytes. Right of it you
+are compute-bound and the levers are better kernels and tensor cores. The ridge point is a property of
+the hardware alone.</p>
+
+<div class="ex"><span class="lbl">Example 5-A: the ridge point of this card</span>
+<pre>ridge = peak FLOP/s / bandwidth = 51e12 / 360e9 = 141.7 ~= 142 FLOP/byte</pre>
+<p style="margin-bottom:0">Meaning: for every byte you pull from VRAM, you must do 142 floating point
+operations before the arithmetic units become the limit. Anything below that and the chip is waiting
+on memory.</p>
+</div>
+
+<h3>5.2 The result worth memorising: decode has an intensity of exactly 1</h3>
+<p>This falls out cleanly and it is the cleanest single derivation in the week.</p>
+<div class="ex"><span class="lbl">Example 5-B: decode arithmetic intensity, batch 1</span>
+<pre>FLOPs per token   = 2 x params            (2 per weight: one multiply, one add)
+bytes per token   = 2 x params            (fp16 is 2 bytes per weight)
+
+AI = (2 x params) / (2 x params) = 1.0 FLOP/byte     exactly, for any fp16 model
+
+with real numbers:
+  FLOPs = 2 x 1,543,714,304           = 3.087e9 FLOP
+  bytes = 2 x 1,543,714,304           = 3.087e9 B  = 3.09 GB
+  AI    = 1.0                          vs a ridge of 142  ->  142x memory-bound</pre>
+</div>
+<p>The dtype cancels. In int8 it is 2 FLOP/byte, in int4 it is 4. That is exactly why weight-only
+quantisation is a bandwidth play and not a compute play: it does not make the maths faster, it makes
+there be fewer bytes in front of the same maths.</p>
+
+<h3>5.3 Batching moves you along the axis, and you can compute where the knee should be</h3>
+<p>Add a second sequence to the batch. The weights are read once and serve two rows, so the bytes stay
+fixed and the FLOPs double.</p>
+<div class="ex"><span class="lbl">Example 5-C: intensity as a function of batch size</span>
+<pre>AI(B) = (2 x params x B) / (2 x params) = B FLOP/byte
+
+B = 1     AI = 1      memory-bound, tensor cores nearly idle
+B = 64    AI = 64     still left of the ridge
+B = 142   AI = 142    the ridge. compute becomes the limit
+B = 256   AI = 256    compute-bound
+
+so the predicted knee is at batch ~142</pre>
+</div>
+<p><b>Measured knee: 64.</b> The prediction is high, and the reason is that the derivation above
+ignores the KV cache. KV bytes do <i>not</i> amortise across the batch: each sequence has its own
+cache and each one must be read. So the true denominator grows with B, real intensity is below B, and
+the ridge arrives earlier than the clean formula says. Being able to state both the clean prediction
+and the reason it overshoots is a stronger answer than either number alone.</p>
+
+<h3>5.4 Prefill sits on the other side, for the same reason</h3>
+<div class="ex"><span class="lbl">Example 5-D: prefill intensity, 512-token prompt</span>
+<pre>AI = (2 x params x 512) / (2 x params) = 512 FLOP/byte     vs ridge 142
+512 / 142 = 3.6x past the ridge  ->  compute-bound
+
+and the threshold: a prompt shorter than 142 tokens is MEMORY-bound prefill</pre>
+</div>
+<p>Prefill and decode are the same operation at two different values of one variable. That single
+sentence explains the whole 150x throughput asymmetry, and it also explains why a serving engine
+cares so much about batching short requests together.</p>
+
+<h3>5.5 Theoretical and achievable bandwidth, and why you must say which one</h3>
+<table>
+<tr><th>Figure</th><th>Value</th><th>Source</th><th>Use it for</th></tr>
+<tr><td>Theoretical</td><td>360.0 GB/s</td><td>NVML: 7501 MHz over a 192-bit bus</td>
+<td>The ridge point, and nothing else</td></tr>
+<tr><td>Achievable</td><td>291.5 GB/s (81% of theoretical)</td>
+<td><code>scripts/measure_bandwidth.py</code>, large streaming read</td>
+<td>Every efficiency percentage you quote</td></tr>
+</table>
+<p>The 19% shortfall is DRAM refresh, row activation, and the fact that no real access pattern is
+perfectly sequential. Quoting a percentage against the theoretical figure makes your own engine look
+worse than it is.</p>
+<div class="ex"><span class="lbl">Example 5-E: the same run, two denominators</span>
+<pre>vLLM decode: 247 GB/s achieved
+  against 291.5 achievable  ->  85% MBU      &lt;- the honest number
+  against 360.0 theoretical ->  69% MBU      &lt;- what docs/baseline-vllm-results.md says
+
+decode ceiling in tok/s:  291.5 / 3.09 = 94 tok/s     (achievable)
+                          360.0 / 3.09 = 117 tok/s    (theoretical, unreachable)</pre>
+</div>
+
+<h3>5.6 Pope et al., and what to take from it</h3>
+<p><a href="https://arxiv.org/abs/2211.05102">Efficiently Scaling Transformer Inference</a> is the one
+paper to read twice this week. What it gives you that nothing else does: it treats inference as a
+partitioning problem with an explicit cost model, derives which parallelism layout wins in which
+regime, and it is the origin of the latency-versus-throughput framing that every serving paper since
+has assumed. For an academic interview it is the paper that shows you think in cost models rather than
+in benchmarks.</p>
+
+<p class="links"><b>Sources:</b>
+<a href="https://arxiv.org/abs/2211.05102">Pope et al., Efficiently Scaling Transformer Inference</a> &middot;
+<a href="https://dl.acm.org/doi/10.1145/1498765.1498785">Williams et al., Roofline</a> &middot;
+<a href="https://horace.io/brrr_intro.html">Horace He, Making Deep Learning Go Brrrr</a> &middot;
+<a href="https://kipp.ly/transformer-inference-arithmetic/">kipply, Transformer Inference Arithmetic</a></p>
+
+<!-- ===================== DAY 6 ===================== -->
+<h2 class="day">Day 6 &nbsp;&middot;&nbsp; Inference arithmetic you can redo on a whiteboard</h2>
+
+<h3>6.1 Counting the parameters, and hitting the published total exactly</h3>
+<p>This is a standard interview exercise. It is not hard, it is just bookkeeping, and getting it right
+in front of someone proves you know what is actually in the model.</p>
+<div class="ex"><span class="lbl">Example 6-A: Qwen2.5-1.5B, summed to the published count</span>
+<pre>Embedding (tied input/output, counted once)
+  151,936 x 1,536                            =   233,373,696
+
+Per layer:
+  q_proj    1536 x 1536 + bias 1536          =     2,360,832
+  k_proj    1536 x  256 + bias  256          =       393,472   (2 KV heads x 128 = 256)
+  v_proj    1536 x  256 + bias  256          =       393,472
+  o_proj    1536 x 1536, no bias             =     2,359,296
+  gate_proj 1536 x 8960                      =    13,762,560
+  up_proj   1536 x 8960                      =    13,762,560
+  down_proj 8960 x 1536                      =    13,762,560
+  2 x RMSNorm weight (1536 each)             =         3,072
+                                  per layer  =    46,797,824
+  x 28 layers                                = 1,310,339,072
+  + embedding                                =   233,373,696
+  + final RMSNorm                            =         1,536
+                                      TOTAL  = 1,543,714,304    matches exactly
+
+fp16 bytes = 1,543,714,304 x 2 = 3,087,428,608 B = 2944.40 MiB
+measured resident on the card                    = 2945.29 MiB   (0.89 MiB over)</pre>
+</div>
+<p>Two things to say out loud from that table:</p>
+<ul class="tight">
+<li><b>The MLP is 88% of each layer</b> (41.29M of 46.80M), attention is 11.8%. Most of the weight
+traffic is MLP. Almost all of the systems complexity is attention, because attention is the part
+whose cost grows with sequence length.</li>
+<li><b>The embedding is 15.1% of the model</b> and does zero arithmetic. Pure lookup.</li>
+</ul>
+<p>The 0.89 MiB overshoot is RoPE <code>inv_freq</code> buffers plus allocator rounding. Knowing why
+your measurement is slightly above the floor, rather than hand-waving it, is the difference between
+a measurement and a number.</p>
+
+<h3>6.2 The 2 x params per token rule, derived and bounded</h3>
+<p>Every weight in a linear layer is used exactly once per token: one multiply, one add. Two floating
+point operations per parameter. That is the whole derivation.</p>
+<div class="ex"><span class="lbl">Example 6-B: check the ratio on one real projection</span>
+<pre>q_proj at batch 1, one token:  [1, 1536] x [1536, 1536]
+FLOPs  = 2 x M x K x N = 2 x 1 x 1536 x 1536 = 4,718,592
+params = 1536 x 1536                          = 2,359,296
+ratio  = 4,718,592 / 2,359,296                = 2.000    exactly, as claimed</pre>
+</div>
+<div class="key"><b>State the caveat before you are asked.</b> The rule counts linear layers only. It
+ignores the attention score computation, which grows as <code>seq&sup2;</code> while the linear term
+grows as <code>seq</code>. At 512 tokens attention adds about 3% and the rule is fine. Past a few
+thousand tokens it undercounts, and past tens of thousands it is wrong.</div>
+
+<h3>6.3 MBU and MFU: pick the one that matches your bound</h3>
+<table>
+<tr><th></th><th>MFU (model FLOPs utilisation)</th><th>MBU (model bandwidth utilisation)</th></tr>
+<tr><td>Definition</td><td>achieved FLOP/s / peak FLOP/s</td><td>achieved GB/s / achievable GB/s</td></tr>
+<tr><td>Use for</td><td>Prefill, training, large batches</td><td>Decode at small batch</td></tr>
+<tr><td>Why</td><td>Compute-bound, so FLOPs is the scarce resource</td>
+<td>Memory-bound, so bytes is the scarce resource</td></tr>
+</table>
+<div class="ex"><span class="lbl">Example 6-C: both metrics on your own runs</span>
+<pre>PREFILL, 512 tokens, MFU
+  FLOPs   = 2 x 1.544e9 x 512 = 1.58e12
+  HF      122 ms -> 12.99 TFLOPS / 51 = 25.5% MFU
+  vLLM    124 ms -> 12.78 TFLOPS / 51 = 25.1% MFU
+
+DECODE, batch 1, MBU  (bytes = 3.09 GB per token, denominator 291.5 GB/s)
+  HF      28.1 tok/s -> 35.6 ms -> 86.8 GB/s  -> 29.8% MBU
+  vLLM    79.9 tok/s -> 12.5 ms -> 247.0 GB/s -> 84.7% MBU</pre>
+</div>
+<p>Reporting decode as MFU would be a category error and an interviewer will notice. Decode at batch
+1 runs at roughly 3.087e9 FLOP / 0.0125 s = 0.25 TFLOPS, which is 0.5% of the compute peak. That
+number is true and completely uninformative, because compute was never the constraint.</p>
+
+<h3>6.4 The latency-throughput Pareto, measured</h3>
+<p>The two things a serving system is asked for pull against each other. Latency is per-token time
+for one user (TPOT). Throughput is tokens per second across all users. Batching buys the second at the
+cost of the first, and the useful question is where the exchange rate turns bad.</p>
+<div class="ex"><span class="lbl">Example 6-D: your vLLM batch sweep, realistic pool</span>
+<pre>throughput derived as batch / TPOT, from results/vllm_batch_sweep.csv
+
+ batch    TPOT ms    throughput tok/s     what is happening
+     1      11.28                88.6     memory-bound, weights read for one row
+    16      17.13               934       still nearly free: 15x work, 1.5x latency
+    32      21.31              1502
+    64      23.73              2697       <-- knee. 30x throughput for 2.1x latency
+   128      44.30              2889       +7% throughput for +87% latency
+   256      86.29              2967       +10% throughput for +264% latency</pre>
+</div>
+<div class="key"><b>How to say it.</b> From batch 1 to 64 throughput rose 30x while per-token latency
+rose only 2.1x, because the weight read was already being paid and batching just spread it over more
+rows. Past 64 the tensor cores are saturated, so extra sequences buy almost no throughput and cost
+latency linearly. If the SLO is a TPOT budget, 64 is the answer on this hardware and this model.</div>
+
+<p class="links"><b>Sources:</b>
+<a href="https://kipp.ly/transformer-inference-arithmetic/">kipply, Transformer Inference Arithmetic</a> &middot;
+<a href="https://www.databricks.com/blog/llm-inference-performance-engineering-best-practices">Databricks, LLM Inference Performance Engineering (MBU)</a> &middot;
+<a href="https://arxiv.org/abs/2211.05102">Pope et al.</a></p>
+
+<!-- ===================== DAY 7 ===================== -->
+<h2 class="day">Day 7 &nbsp;&middot;&nbsp; Buffer and rehearsal</h2>
+
+<p>No new material. This day exists because plans slip, and because the failure mode of a three-week
+plan is finishing the reading and being unable to say any of it out loud.</p>
+
+<h3>7.1 The rehearsal protocol</h3>
+<p>For each item below: close the notes, say it out loud, time it, and stop at 90 seconds. If you
+cannot, do not re-read. <b>Re-derive it from a blank page.</b> Re-reading produces recognition, which
+is not what an interview tests.</p>
+
+<h3>7.2 The six derivations from Week 1</h3>
+<table>
+<tr><th>#</th><th>Derive, unaided</th><th>Lands on</th></tr>
+<tr><td>1</td><td>Why attention scores are divided by <code>sqrt(d_head)</code></td>
+<td>Variance d, std 11.3 at head_dim 128, softmax saturation</td></tr>
+<tr><td>2</td><td>The KV cache size formula, for this model</td><td>28 KiB/token, from 2 KV heads</td></tr>
+<tr><td>3</td><td>RoPE's score depends only on <code>m - n</code></td><td>0.90930 both ways</td></tr>
+<tr><td>4</td><td>The ridge point and where the two phases sit</td>
+<td>142 FLOP/byte; decode 1, prefill 512</td></tr>
+<tr><td>5</td><td>The parameter count</td><td>1,543,714,304, summed not quoted</td></tr>
+<tr><td>6</td><td>Prefill vs decode asymmetry</td><td>4205 vs 28.1 tok/s = 150x</td></tr>
+</table>
+
+<h3>7.3 The four anchor answers</h3>
+<p>Almost any question in this field routes back to one of these. Two of them are already fully
+supported by Week 1 material; two arrive in Week 2.</p>
+<ol class="tight">
+<li><b>The KV-cache OOM story</b> (ready now). 123,565 tokens, 62 KiB/token measured against 28
+predicted, <code>torch.cat</code> copy-on-grow, then external fragmentation with 1.3 GiB free inside
+the pool.</li>
+<li><b>The HF-vs-vLLM profiling result</b> (ready now). 28.09 ms/token saved, 25.34 ms of it idle
+time removed (90%), 2.60 ms faster kernels (9%), launches per step 1198 to 17.</li>
+<li><b>The batching knee</b> (numbers ready, framing in Week 2 Days 5-6). Knee at 64: 30x throughput
+for 2.1x latency, then the exchange rate collapses.</li>
+<li><b>The FlashAttention derivation</b> (Week 2 Days 2-4). The one anchor the repo cannot support
+with a measurement, so the derivation itself has to carry it.</li>
+</ol>
+
+<h3>7.4 Known weak spots, named on purpose</h3>
+<ul class="tight">
+<li>No hand-written CUDA kernel yet. Reading fluency was the Week 1 goal, not authorship. The honest
+line is "I can read a kernel and tell you why it is slow; I have not shipped one."</li>
+<li>The batching knee is measured on one GPU and one 1.5B model. Do not generalise it to a 70B model
+out loud.</li>
+<li>The two-box variance result (two nominally identical 3060s, 1.22x apart, cause unexplained) is a
+good answer to "tell me about a measurement you could not explain" and a bad thing to be surprised
+by.</li>
+</ul>
+
+<!-- ===================== DAY 8 ===================== -->
+<h2 class="day">Day 8 &nbsp;&middot;&nbsp; PagedAttention: the KV cache as a memory manager problem</h2>
+
+<h3>8.1 The setup</h3>
+<p>You already have the size formula from Day 2: <code>28 KiB per token</code> for this model. Day 8
+is about what a serving engine does with that number when many sequences are alive at once and none
+of them has told you how long it will be.</p>
+<p>The naive approach, which is what HuggingFace does, is one contiguous buffer per sequence. That
+forces a choice at admission time: how big? You do not know the output length in advance, so you
+reserve for the maximum. Everything that goes wrong follows from that one decision.</p>
+
+<h3>8.2 The three wastes</h3>
+<p>The PagedAttention paper names three, and they are distinct. Being able to separate them is the
+point of this day.</p>
+<table>
+<tr><th>Waste</th><th>What it is</th><th>Where it shows in your run</th></tr>
+<tr><td><b>Reservation</b></td>
+<td>Memory reserved for tokens the sequence will eventually generate but has not yet. Held, unusable
+by anyone else, for the whole lifetime of the request.</td>
+<td>Not visible in your HF sweep, because you ran one sequence and grew it organically. It is the
+dominant waste in real multi-request serving.</td></tr>
+<tr><td><b>Internal fragmentation</b></td>
+<td>Memory inside the reserved block that is never used, because the sequence stopped short of the
+maximum length it was sized for.</td>
+<td>Also not visible at batch 1. Under a naive engine with <code>max_model_len 784</code> and a
+sequence that stops at 100 tokens, 87% of that sequence's reservation is dead.</td></tr>
+<tr><td><b>External fragmentation</b></td>
+<td>Free memory that exists but is broken into gaps, none large enough for the contiguous block being
+requested.</td>
+<td><b>This is literally your crash.</b> OOM at 10,437 MiB allocated with 11,764 MiB reserved:
+1.3 GiB free inside the pool, no single gap big enough for the next
+<code>2 x KV</code> slab.</td></tr>
+</table>
+<div class="key"><b>The sentence that makes this yours.</b> "External fragmentation is not a concept I
+read about, it is the specific failure I watched. The card had 1.3 GiB free and still raised
+<code>OutOfMemoryError</code>, because <code>torch.cat</code> needed one contiguous allocation and the
+free space was scattered between blocks the allocator had already parked."</div>
+
+<h3>8.3 The mechanism: block tables</h3>
+<p>PagedAttention borrows the idea that operating systems use for virtual memory. Stop requiring the
+KV cache of a sequence to be contiguous. Instead:</p>
+<ol class="tight">
+<li>Cut the KV memory into fixed-size <b>blocks</b>, each holding a fixed number of tokens. vLLM used
+16 tokens per block in your run.</li>
+<li>Give every sequence a <b>block table</b>: a list mapping its logical token positions to the
+physical blocks that actually hold them.</li>
+<li>When a sequence needs room for token 17, allocate <i>one</i> free block from the pool and append
+it to that sequence's table. No copy, no contiguity requirement, no growth of anything already
+written.</li>
+<li>The attention kernel is rewritten to read through the block table instead of striding a flat
+array.</li>
+</ol>
+<p>All three wastes go away at once. Reservation waste goes because you allocate a block at a time
+instead of a maximum-length buffer. Internal fragmentation is bounded to at most one block per
+sequence (at most 15 wasted token slots out of 16). External fragmentation is impossible because
+every block is the same size, so any free block fits any request.</p>
+
+<div class="ex"><span class="lbl">Example 8-A: the pool in your own vLLM run</span>
+<pre>from the engine init log and results/vllm_batch_sweep.csv:
+  num_gpu_blocks   = 14,836 blocks
+  block size       =     16 tokens
+  pool capacity    = 14,836 x 16 = 237,376 tokens
+  pool bytes       = 237,376 x 28 KiB = 6.34 GiB          matches the log
+
+compare against the HF path on the identical card:
+  HF   died at 123,565 tokens of one sequence
+  vLLM held    237,376 tokens of KV, and never OOMs this way at all
+
+ratio = 237,376 / 123,565 = 1.92x, which is the 2x that torch.cat was costing</pre>
+</div>
+<p>That 1.92x is worth pausing on. It is almost exactly the copy-on-grow factor from Day 2. The paged
+engine fits nearly twice the context on the same card, and the reason is not a better kernel or a
+smaller cache. It is that it never pays for the same token twice.</p>
+
+<h3>8.4 Why vLLM has no OOM curve at all</h3>
+<p>A detail that makes the experimental design defensible. vLLM reserves the entire KV pool as one
+slab at startup, sized by <code>gpu_memory_utilization</code> (0.9 in your run). So device memory is
+<i>flat</i> for the whole sweep. There is no rising curve and no crash. When the pool fills, vLLM does
+not fail, it <b>schedules fewer sequences and queues the rest</b>.</p>
+<div class="key"><b>The methodological point.</b> The failure mode moved from a crash to a queue. To
+observe the KV wall in vLLM you read block occupancy and queue depth, not <code>nvidia-smi</code>.
+This is why the OOM experiment had to be run on HuggingFace: HF grows organically, so the crash is a
+real memory event you can plot. That contrast is the result, not a limitation of the setup.</div>
+
+<h3>8.5 Prefix caching and RadixAttention, in one paragraph</h3>
+<p>Blocks are immutable once written, so two sequences that share a prefix can point at the
+<i>same</i> physical blocks instead of each holding a copy. Reference counting handles the sharing,
+and copy-on-write handles the point where they diverge. vLLM exposes this as prefix caching.
+RadixAttention (SGLang) goes further: it keeps completed requests' blocks in a radix tree keyed by
+token prefix, so a later request that shares a prefix with an earlier one skips that much prefill
+entirely. This matters enormously for system prompts, few-shot examples, and multi-turn chat, where
+the shared prefix is most of the input. Note that this is a <i>prefill</i> optimisation, not a decode
+one, so it moves TTFT rather than TPOT.</p>
+<p class="small">Your vLLM baseline explicitly disabled prefix caching, so the second run could not
+reuse the first run's prefill. That is why the measurement is honest.</p>
+
+<h3>8.6 Exit bar for Days 5-8</h3>
+<ol class="tight">
+<li>Draw the roofline, mark the ridge at 142 FLOP/byte, and place decode (AI 1) and prefill
+(AI 512) on it.</li>
+<li>Derive AI = 1 for fp16 decode in two lines, and say why int4 makes it 4.</li>
+<li>Predict the batching knee at 142 from AI(B) = B, then explain why the measured knee is 64.</li>
+<li>Sum the parameter count to 1,543,714,304 without notes.</li>
+<li>State MBU vs MFU and give one measured value of each from your own runs.</li>
+<li>Name the three wastes and say which one caused your OOM, with the two memory figures.</li>
+</ol>
+
+<h3>8.7 Self-test</h3>
+<p><b>Q1. Estimate the memory bandwidth needed to serve this model at 100 tok/s at batch 1.</b><br>
+Each token reads the full weight set, 3.09 GB. 100 tok/s therefore needs 309 GB/s of achievable
+bandwidth. This card achieves 291.5 GB/s, so 100 tok/s is not reachable at batch 1 on this hardware.
+The ceiling is 94 tok/s, and vLLM's measured 79.9 is 85% of it.</p>
+<p><b>Q2. Why did quantising to NF4 make your decode slower, when quantisation is a bandwidth
+play?</b><br>
+Because <code>bitsandbytes</code> dequantises the weights back to fp16 before the GEMM. The bytes are
+smaller on the card (2945 to 1099 MiB) but the dequantisation happens on the critical path and the
+matmul still consumes fp16. So no bandwidth is saved where it counts, and the extra work costs time:
+28.1 down to 12.4 tok/s. The lesson is that a quantisation win requires a kernel that consumes the
+quantised format directly.</p>
+<p><b>Q3. Your engine reserves 6.34 GiB of KV at startup and never releases it. Is that
+wasteful?</b><br>
+No, it is the opposite. A fixed pool of uniform blocks makes external fragmentation impossible and
+makes admission control a counting problem rather than an allocation gamble. The cost is that the
+memory cannot be used for anything else, which is fine because on an inference server there is
+nothing else. The alternative, organic growth, is what fragmented and crashed at 123,565 tokens.</p>
+<p><b>Q4. Why does batching help so much at batch 1 to 16, and so little at 128 to 256?</b><br>
+Because arithmetic intensity at batch B is roughly B FLOP/byte and the ridge is 142. Below the ridge
+the weight read is already paid and extra sequences ride along free, so throughput scales almost
+linearly while latency barely moves. Above it the tensor cores are the constraint, so each added
+sequence costs proportional compute. Measured: 30x throughput for 2.1x latency up to batch 64, then
+10% more throughput for 264% more latency out to 256.</p>
+
+<p class="links"><b>Sources:</b>
+<a href="https://arxiv.org/abs/2309.06180">Kwon et al., Efficient Memory Management for LLM Serving with PagedAttention</a> &middot;
+<a href="https://arxiv.org/abs/2312.07104">Zheng et al., SGLang / RadixAttention</a> &middot;
+<a href="https://blog.vllm.ai/2023/06/20/vllm.html">vLLM launch post</a> &middot;
+<a href="https://arxiv.org/abs/2211.05102">Pope et al.</a></p>
+
+<hr>
+<p class="small">Repo sources for every measured number above: <code>results/baseline_hf.csv</code>,
+<code>results/baseline_vllm.csv</code>, <code>results/oom_sweep.csv</code>,
+<code>results/vllm_batch_sweep.csv</code>, <code>results/profile_summary.csv</code>,
+<code>docs/profiling.md</code>, <code>docs/oom-results.md</code>. Where a CSV and a prose doc
+disagree, the CSV is used.</p>
