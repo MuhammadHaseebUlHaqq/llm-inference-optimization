@@ -282,9 +282,11 @@ card died. The full write-up is <code>docs/oom-results.md</code>.</p>
 <tr><td>Weights resident</td><td>2945 MiB</td></tr>
 <tr><td>Peak allocated at OOM</td><td>10,437 MiB</td></tr>
 <tr><td>Peak reserved at OOM</td><td>11,764 MiB (card total 12,288 MiB)</td></tr>
-<tr><td>Predicted slope (formula above)</td><td>28 KB / token</td></tr>
-<tr><td>Measured slope</td><td><b>~60 KB / token, about 2.15x the prediction</b></td></tr>
+<tr><td>Predicted slope (formula above)</td><td>28 KiB / token</td></tr>
+<tr><td>Measured slope</td><td><b>62 KiB / token, 2.21x the prediction</b></td></tr>
 </table>
+<p class="small">Slope from the CSV directly: (10,437.33 - 2945.29) MiB x 1024 / 123,533 tokens =
+62.10 KiB/token.</p>
 <p>The 2x is not noise, and finding its cause is the interesting part. HuggingFace grows the cache
 with <code>torch.cat([old_cache, new_kv])</code> on every single token. A tensor cannot grow in
 place, so <code>cat</code> allocates a fresh contiguous block for <i>n+1</i> tokens and copies the
@@ -295,7 +297,8 @@ weights + 1 x KV    2945 + 3281          = 6226 MiB     (textbook answer, wrong)
 weights + 2 x KV    2945 + 2 x 3281      = 9507 MiB     (reallocation model)
 measured allocated                       = 10,226 MiB   (+~700 MiB attention scratch)
 
-slope check: d/dn (weights + 2 KV) = 2 x 28 KB = 56 KB/token   vs  ~60 measured</pre>
+slope check: d/dn (weights + 2 KV) = 2 x 28 = 56 KiB/token  vs 62 measured
+             the extra 6 KiB is attention working memory, which also grows with n</pre>
 </div>
 <p>Two more results worth carrying into an interview:</p>
 <ul class="tight">
@@ -434,21 +437,22 @@ prefill and decode on that axis with measured numbers.</p>
 <p>The same weights, the same kernels, and a thousandfold difference in efficiency. That is the
 central fact of inference optimisation. Decode reads the entire model to produce one token.</p>
 
-<h3>4.2 Measured prefill: compute-bound, at 23% of the ceiling</h3>
+<h3>4.2 Measured prefill: compute-bound, at 25% of the ceiling</h3>
 <div class="ex"><span class="lbl">Example 4-A: prefill against the compute ceiling</span>
 <pre>FLOPs for a forward pass ~= 2 x params x tokens
    = 2 x 1.544e9 x 512      = 1.58e12 FLOP
 floor at 51 TFLOPS          = 1.58e12 / 51e12 = 31 ms
-measured (HuggingFace)      = 137 ms     ->  11.5 TFLOPS effective, 23% of peak
-measured (vLLM)             = 124 ms     ->  25% of peak, only 1.1x better</pre>
+measured (HuggingFace)      = 122 ms  = 4205 tok/s -> 12.99 TFLOPS, 25.5% of peak
+measured (vLLM)             = 124 ms  = 4114 tok/s -> 25.1% of peak, 2% SLOWER</pre>
 </div>
 <p>The "2 x params" rule comes from every weight being touched once, with one multiply and one add per
 weight. It counts linear layers only and ignores the attention term that grows as
 <code>seq&sup2;</code>, which is fine at 512 tokens (about 3% extra) and wrong past a few thousand.</p>
-<p><b>Read the vLLM number carefully.</b> vLLM barely beats HuggingFace at prefill, and that is the
-expected answer, not a disappointment. Both hand the same GEMMs to the same cuBLAS tensor-core
-kernels. There is no algorithm to beat. Prefill is already near the ceiling, so this is where a fast
-engine has the least to offer.</p>
+<p><b>Read the vLLM number carefully.</b> vLLM does not beat HuggingFace at prefill at all here, it is
+2% slower, and that is the expected answer rather than a disappointment. Both hand the same GEMMs to
+the same cuBLAS tensor-core kernels. There is no algorithm to beat. Prefill is already near the
+practical ceiling, so this is where a fast engine has the least to offer. Saying this confidently is
+a better signal than claiming a win that the measurement does not support.</p>
 
 <h3>4.3 Measured decode: memory-bound, and the number to quote is MBU</h3>
 <p>For a memory-bound phase, the right efficiency metric is not FLOPS but <b>memory bandwidth
@@ -457,7 +461,10 @@ utilisation</b>: the bytes you actually moved per second, divided by the bytes t
 <pre>bytes that must move per decode token = 3.09 GB (the weights)
 
 vLLM   79.9 tok/s -> 12.5 ms/token -> 3.09 GB / 0.0125 s = 247 GB/s -> 85% of 291.5 achievable
-HF     ~20 tok/s  -> ~50 ms/token  -> 3.09 GB / 0.050 s  =  62 GB/s -> ~21% of achievable
+HF     28.1 tok/s -> 35.6 ms/token -> 3.09 GB / 0.0356 s =  87 GB/s -> 30% of achievable
+
+gap = 79.9 / 28.1 = 2.84x  (older notes in this repo say ~4x, from two early
+                            HF runs at 18.0 and 23.2 tok/s; the settled value is 28.1)
 
 theoretical ceiling: 291.5 GB/s / 3.09 GB = 94 tok/s, whatever software you write</pre>
 </div>
@@ -466,10 +473,12 @@ bandwidth at batch 1. It is close to the hardware limit, so no further kernel wo
 batch 1. The only ways past 94 tok/s are to move fewer bytes (quantisation) or to serve more tokens
 per byte read (batching).</div>
 
-<h3>4.4 So where did HuggingFace lose the other 60 tok/s?</h3>
+<h3>4.4 So where did HuggingFace lose the other 52 tok/s?</h3>
 <p>The obvious guess is slow kernels. The measurement says otherwise. Both engines were profiled per
 decode step (<code>docs/profiling.md</code>), separating time the GPU spent computing from time it
-spent idle waiting for the CPU to hand it the next kernel.</p>
+spent idle waiting for the CPU to hand it the next kernel. The profiling run is its own paired
+measurement, so its HF step time (40.65 ms, 24.6 tok/s) differs slightly from the 28.1 tok/s baseline
+run. Compare rows within this table, not against the table above.</p>
 <table>
 <tr><th>Run</th><th>GPU kernels / step</th><th>CPU launches / step</th><th>GPU busy</th>
 <th>Step time</th><th>Idle</th></tr>
@@ -519,7 +528,7 @@ throughput knee in <code>results/vllm_batch_sweep.csv</code> is that crossing, m
 heads and not the 12 query heads appear in it.</li>
 <li>Show that a RoPE score depends only on <code>m - n</code>.</li>
 <li>Compute the ridge point as 142 FLOP/byte and place prefill and decode either side of it.</li>
-<li>Explain the 123,565-token OOM cliff, including why the measured slope was 60 KB/token and not
+<li>Explain the 123,565-token OOM cliff, including why the measured slope was 62 KiB/token and not
 28.</li>
 <li>Explain the HF-to-vLLM decode gap as 90% idle time and 9% faster kernels, and say what CUDA
 graphs changed.</li>
@@ -533,15 +542,15 @@ The cache is sized by KV heads (2 here), which GQA cuts. The weights are dominat
 Keep a running maximum and a running sum. When a new tile contains a larger maximum, rescale the
 accumulated result by <code>exp(old_max - new_max)</code> and carry on. The answer is exact, not an
 approximation. That is online softmax, and it is what makes FlashAttention possible.</p>
-<p><b>Q3. Your GPU has 51 TFLOPS. Why is your decode at 20 tok/s?</b><br>
+<p><b>Q3. Your GPU has 51 TFLOPS. Why is your decode at 28 tok/s?</b><br>
 Because decode does not use FLOPS. It moves 3.09 GB of weights per token at an arithmetic intensity
-of roughly 1 FLOP/byte, far below the 142 FLOP/byte ridge. The binding limit is 291.5 GB/s of
-bandwidth, which caps the model at 94 tok/s at batch 1, and HuggingFace only reached 21% of that
-because the GPU was idle 62% of every step.</p>
+of exactly 1 FLOP/byte, 142x below the ridge. The binding limit is 291.5 GB/s of bandwidth, which
+caps the model at 94 tok/s at batch 1, and HuggingFace only reached 30% of that because the GPU was
+idle 62% of every step.</p>
 <p><b>Q4. Walk me through a memory problem you have debugged.</b><br>
-The OOM sweep. Predicted 28 KB/token, measured 60. The cause was HuggingFace's per-token
+The OOM sweep. Predicted 28 KiB/token, measured 62. The cause was HuggingFace's per-token
 <code>torch.cat</code> keeping the old and new cache live at once, which makes the real slope
-2 x 28 = 56 KB/token, plus attention scratch. The crash itself was fragmentation: 10,437 MiB
+2 x 28 = 56 KiB/token, plus attention scratch. The crash itself was fragmentation: 10,437 MiB
 allocated against 11,764 MiB reserved, so 1.3 GiB was free but not contiguous. PagedAttention removes
 both effects, and vLLM held 237,376 tokens in 6.34 GiB on the same card.</p>
 
