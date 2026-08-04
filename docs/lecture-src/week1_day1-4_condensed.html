@@ -1,0 +1,558 @@
+<meta charset="utf-8">
+<title>Week 1, Days 1-4: Attention, RoPE, GQA, and the GPU</title>
+<style>
+@page { size: A4; margin: 14mm 15mm 14mm 15mm; }
+* { box-sizing: border-box; }
+body { font-family: "Charter", "Georgia", serif; font-size: 10.2pt; line-height: 1.38; color: #16181d; }
+h1 { font-size: 19pt; margin: 0 0 2px 0; line-height: 1.15; }
+h2 { font-size: 13pt; margin: 16px 0 6px 0; padding: 4px 0 4px 8px;
+     border-left: 4px solid #2b5fa8; background: #eef2f8; page-break-after: avoid; }
+h3 { font-size: 11pt; margin: 11px 0 4px 0; color: #1c3f70; page-break-after: avoid; }
+p { margin: 5px 0; }
+ul, ol { margin: 5px 0 5px 0; padding-left: 19px; }
+li { margin: 2px 0; }
+code, pre { font-family: "Consolas", "DejaVu Sans Mono", monospace; }
+code { font-size: 9pt; background: #f2f3f5; padding: 0 2px; border-radius: 2px; }
+pre { font-size: 8.6pt; background: #f7f8fa; border: 1px solid #dde1e8; border-radius: 3px;
+      padding: 6px 8px; margin: 6px 0; line-height: 1.32; white-space: pre-wrap;
+      overflow-x: auto; page-break-inside: avoid; }
+table { border-collapse: collapse; width: 100%; margin: 6px 0; font-size: 9.2pt;
+        page-break-inside: avoid; }
+th, td { border: 1px solid #ccd2dc; padding: 3px 6px; text-align: left; vertical-align: top; }
+th { background: #eef2f8; font-weight: 600; }
+.sub { color: #55606f; font-size: 10pt; margin: 0 0 10px 0; }
+.ex { border: 1px solid #b9cbe4; background: #f4f8fd; border-radius: 3px;
+      padding: 6px 9px; margin: 7px 0; page-break-inside: avoid; }
+.ex .lbl { font-family: Consolas, monospace; font-size: 8.4pt; font-weight: 700;
+           letter-spacing: .04em; color: #2b5fa8; text-transform: uppercase; display: block;
+           margin-bottom: 3px; }
+.key { border-left: 3px solid #c58b00; background: #fdf7e8; padding: 5px 9px; margin: 7px 0;
+       page-break-inside: avoid; }
+.key b { color: #8a6100; }
+a { color: #2b5fa8; text-decoration: none; }
+.links { font-size: 8.9pt; color: #55606f; margin: 5px 0 0 0; }
+.day { page-break-before: always; }
+.tight li { margin: 1px 0; }
+hr { border: 0; border-top: 1px solid #dde1e8; margin: 14px 0 0 0; }
+.small { font-size: 9pt; color: #55606f; }
+</style>
+
+<h1>Week 1, Days 1-4</h1>
+<p class="sub">Attention, RoPE, GQA, and the GPU that runs them. Short version, built on the measured
+numbers in this repo: Qwen2.5-1.5B, fp16, one RTX 3060 12GB.</p>
+
+<p><b>How to read this.</b> Four days, one section each. Every idea gets one small worked example with
+real numbers you can redo by hand. Every claim ends in a number from this repo where one exists. The
+goal is that you can say each idea out loud in under 90 seconds without notes.</p>
+
+<table>
+<tr><th>Day</th><th>Topic</th><th>The one thing you must be able to derive</th></tr>
+<tr><td>1</td><td>Attention from scratch</td><td>Why the score is divided by the square root of d</td></tr>
+<tr><td>2</td><td>RoPE and GQA</td><td>Why GQA shrinks the KV cache but not the weights</td></tr>
+<tr><td>3</td><td>The GPU in three numbers</td><td>The ridge point: 51 TFLOPS / 360 GB/s = 142 FLOP/byte</td></tr>
+<tr><td>4</td><td>Prefill vs decode</td><td>Why decode is memory-bound, in your own measured tok/s</td></tr>
+</table>
+
+<h3>The model and the card, once, for the whole document</h3>
+<pre>Model  Qwen2.5-1.5B, fp16          GPU  RTX 3060 12GB, Ampere sm_86
+  params      1,543,714,304           VRAM         12,288 MiB
+  layers      28                      SMs          28
+  d_model     1536                    fp16 peak    ~51 TFLOPS (tensor cores)
+  query heads 12                       bandwidth    360 GB/s theoretical
+  KV heads    2   (GQA)                             291.5 GB/s measured achievable
+  head_dim    128                     weights on card    2945 MiB
+  vocab       151,936</pre>
+
+<!-- ===================== DAY 1 ===================== -->
+<h2>Day 1 &nbsp;&middot;&nbsp; Attention, from the ground up</h2>
+
+<h3>1.1 What the model actually does</h3>
+<p>A language model takes a sequence of tokens and produces a probability for every possible next
+token. You pick one, append it, and run the whole thing again. That loop has two consequences that
+drive everything else in this field:</p>
+<ol class="tight">
+<li>Generation is <b>sequential</b>. Token 5 cannot start before token 4 exists. No amount of GPU
+fixes this.</li>
+<li>Each step runs over a sequence that is one token longer than the last. Recomputing the whole
+sequence every step would be quadratic waste, so you cache the per-token intermediate values. That
+cache is the <b>KV cache</b>, and it is the single biggest memory object in serving.</li>
+</ol>
+<p>Two phases follow from this, and they behave completely differently:</p>
+<ul class="tight">
+<li><b>Prefill</b>: process the whole prompt at once. Many tokens, one pass. Big matrix work.</li>
+<li><b>Decode</b>: produce one token at a time. One token, many passes. Tiny matrix work, huge memory
+reads.</li>
+</ul>
+
+<h3>1.2 Tokens and embeddings</h3>
+<p>Text is split into subword pieces by a BPE tokenizer. Rule of thumb: about 4 characters per token
+in English. A token is just an integer index, nothing more. The first layer is a lookup table of
+shape <code>[vocab, d_model]</code>: row <i>i</i> is the vector for token <i>i</i>.</p>
+
+<div class="ex"><span class="lbl">Example 1-A: the embedding table costs real memory and zero maths</span>
+<pre>151,936 vocab x 1536 d_model = 233,373,696 params
+x 2 bytes (fp16)             = 466,747,392 bytes = 445 MiB
+share of the model           = 233.4M / 1543.7M = 15.1%</pre>
+<p style="margin-bottom:0">15% of this model is a table you only ever <i>read one row from</i>. No
+multiply, no add, pure memory traffic. That is the theme of the whole field appearing on page one.</p>
+</div>
+
+<h3>1.3 The dot product, and why attention uses it</h3>
+<p><code>a &middot; b = |a||b|cos&theta;</code>. For two unit vectors the dot product <i>is</i> the
+cosine of the angle between them. Same direction gives +1, perpendicular gives 0, opposite gives -1.
+So a dot product is a cheap numeric answer to "how much do these two vectors agree?" Attention needs
+exactly that: how relevant is each earlier token to the one I am processing now.</p>
+
+<h3>1.4 Q, K, V</h3>
+<p>Each token vector is projected three times by learned weight matrices:</p>
+<ul class="tight">
+<li><b>Query (Q)</b>: what this token is looking for.</li>
+<li><b>Key (K)</b>: what this token offers to be matched against.</li>
+<li><b>Value (V)</b>: what this token actually passes along if it is selected.</li>
+</ul>
+<p>You compare every query against every key with dot products, turn those scores into weights that
+sum to 1, and take that weighted mix of the values.</p>
+<pre>Attention(Q, K, V) = softmax( Q K&#7488; / sqrt(d_head) ) V</pre>
+
+<div class="ex"><span class="lbl">Example 1-B: full attention by hand, 3 tokens, d = 2</span>
+<pre>K = [[1,0],       V = [[1,0],       q3 = [1,1]   (the third token's query)
+     [0,1],            [0,1],
+     [1,1]]            [1,1]]
+
+raw scores   q3&middot;k1 = 1     q3&middot;k2 = 1     q3&middot;k3 = 2
+scale /sqrt(2)  0.7071        0.7071        1.4142
+exp             2.0281        2.0281        4.1133      sum = 8.1695
+weights         0.2483        0.2483        0.5035      sum = 1.000
+
+output = 0.2483*[1,0] + 0.2483*[0,1] + 0.5035*[1,1] = [0.7517, 0.7517]</pre>
+<p style="margin-bottom:0">Token 3 matches itself best (score 2 against 1), so it keeps half its
+weight on itself and splits the rest. That is the entire mechanism.</p>
+</div>
+
+<h3>1.5 Why divide by the square root of d</h3>
+<p>This is the derivation that gets asked. Take two vectors of length <i>d</i> whose entries are
+independent with mean 0 and variance 1. Their dot product is a sum of <i>d</i> such products.
+Variances add, so the dot product has variance <i>d</i> and standard deviation <code>sqrt(d)</code>.
+Scores therefore grow with the head dimension. Softmax of large-spread scores saturates: it puts
+almost all weight on one token and the gradients through the others go to zero. Dividing by
+<code>sqrt(d)</code> puts the variance back to 1 regardless of head size.</p>
+
+<div class="ex"><span class="lbl">Example 1-C: what saturation looks like at this model's head_dim = 128</span>
+<pre>head_dim = 128  ->  score std = sqrt(128) = 11.3
+
+unscaled, two typical scores 11.3 apart:
+   exp(11.3) / exp(0) = 80,822       one token takes ~99.999% of the weight
+
+after dividing by sqrt(128), the same pair is 1.0 apart:
+   exp(1.0) / exp(0) = 2.72          a usable 73% / 27% split</pre>
+</div>
+
+<h3>1.6 Softmax numerical stability</h3>
+<p>Softmax uses <code>exp</code>, which overflows fast. fp16 maxes out at 65,504, and
+<code>exp(12)</code> already exceeds that. The fix is that softmax is unchanged if you subtract any
+constant from every score, so you subtract the row maximum. Every exponent becomes 0 or negative,
+so every <code>exp</code> lands in (0, 1].</p>
+
+<div class="ex"><span class="lbl">Example 1-D: max subtraction</span>
+<pre>scores    [100, 101, 102]      exp(102) overflows fp16 and fp32 alike
+minus max [ -2,  -1,   0]      exp -> 0.1353, 0.3679, 1.0000  sum = 1.5032
+softmax   [0.0900, 0.2447, 0.6652]     same answer, no overflow</pre>
+</div>
+<div class="key"><b>Forward reference.</b> Holding a running maximum and rescaling earlier terms when a
+bigger one shows up is exactly the "online softmax" trick. FlashAttention is built on it, which is
+why attention can be computed in tiles that fit in on-chip memory without ever forming the full score
+matrix. Week 2 Days 3-4.</div>
+
+<h3>1.7 Causal masking</h3>
+<p>Token 3 must not see token 5. Before the softmax, set every score at a future position to negative
+infinity. <code>exp(-inf) = 0</code>, so those tokens get exactly zero weight and the remaining
+weights still sum to 1. It is a mask on the score matrix, not a change to the maths.</p>
+
+<h3>1.8 Multi-head attention, and why it is free</h3>
+<p>Instead of one attention over 1536 dimensions, split into 12 heads of 128 each, run attention
+independently in each, then concatenate back to 1536 and pass through an output projection.</p>
+<pre>12 heads x 128 head_dim = 1536 = d_model</pre>
+<p>The parameter count and the FLOP count are identical to single-head. You get several independent
+relational patterns for free. Two consequences that matter later:</p>
+<ul class="tight">
+<li>Smaller heads mean a smaller <code>sqrt(d)</code>, so scores are better conditioned.</li>
+<li>A per-head score matrix is small enough to tile into on-chip SRAM. FlashAttention depends on
+this.</li>
+</ul>
+
+<h3>1.9 The rest of the block, briefly</h3>
+<ul class="tight">
+<li><b>RMSNorm</b>: divide the vector by its own root-mean-square, then scale by a learned gain.
+Cheaper than LayerNorm because it skips the mean subtraction, and models train fine without it.</li>
+<li><b>SwiGLU MLP</b>: three matrices instead of two, one gating the other:
+<code>(silu(x&middot;W_gate) * (x&middot;W_up)) &middot; W_down</code>. Needed because stacking linear
+layers with no nonlinearity in between collapses to a single linear layer.</li>
+<li><b>Residual connections</b>: every block adds its output back to its input, so information and
+gradients have an unobstructed path from input to output.</li>
+</ul>
+<div class="key"><b>The division of labour, in one line.</b> Attention moves information
+<i>between</i> tokens. The MLP processes each token on its own. Most of the weights are MLP, so most
+of the memory traffic is MLP. Almost all the systems complexity is attention, because attention is
+the part whose cost grows with sequence length.</div>
+
+<p class="links"><b>Sources:</b>
+<a href="https://arxiv.org/abs/1706.03762">Vaswani et al., Attention Is All You Need</a> &middot;
+<a href="https://www.youtube.com/watch?v=kCc8FmEb1nY">Karpathy, Let's build GPT from scratch</a> &middot;
+<a href="https://github.com/karpathy/nanoGPT">nanoGPT</a> &middot;
+<a href="https://www.youtube.com/watch?v=eMlx5fFNoYc">3Blue1Brown, Attention visually explained</a> &middot;
+<a href="https://arxiv.org/abs/1805.02867">Milakov &amp; Gimelshein, online softmax</a></p>
+
+<!-- ===================== DAY 2 ===================== -->
+<h2 class="day">Day 2 &nbsp;&middot;&nbsp; RoPE and the KV cache (MHA, MQA, GQA)</h2>
+
+<h3>2.1 The problem RoPE solves</h3>
+<p>Attention is a weighted sum. Shuffle the input tokens and you get the same output in shuffled
+order. The mechanism has no notion of order at all, so position has to be injected deliberately.</p>
+<table>
+<tr><th>Approach</th><th>How</th><th>Weakness</th></tr>
+<tr><td>Learned absolute</td><td>A trained vector per position, added to the embedding</td>
+<td>Cannot go past the trained maximum length. Position 5000 was never seen.</td></tr>
+<tr><td>Sinusoidal absolute</td><td>Fixed sine and cosine of position, added in</td>
+<td>Extrapolates in principle, but the model has to learn to subtract absolute positions to get
+relative ones.</td></tr>
+<tr><td><b>RoPE</b></td><td>Rotate Q and K by an angle proportional to position</td>
+<td>Needs interpolation tricks (YaRN, NTK scaling) far past the trained length, but is otherwise
+the current default.</td></tr>
+</table>
+
+<h3>2.2 The RoPE mechanism</h3>
+<p>Split each head's 128 dimensions into 64 pairs. Treat each pair as a point in a plane. For a token
+at position <i>m</i>, rotate pair <i>i</i> by the angle <code>m &middot; theta_i</code>, where
+<code>theta_i = 10000^(-2i/head_dim)</code>. Early pairs rotate fast and encode fine local position;
+late pairs rotate slowly and encode coarse long-range position. Apply the same rotation rule to Q and
+to K. Nothing is added to V, and no parameters are learned.</p>
+<p>The property that makes it work: rotations compose. Rotating Q by <i>m</i> and K by <i>n</i>, then
+taking the dot product, gives a result that only depends on <code>m - n</code>. The model gets
+relative position for free out of an absolute operation.</p>
+
+<div class="ex"><span class="lbl">Example 2-A: verify the relative property numerically (one pair, theta = 1)</span>
+<pre>q = [1, 0] at position m = 5      k = [0, 1] at position n = 3
+
+rotate q by 5 rad:  [cos5,  sin5]   = [ 0.28366, -0.95892]
+rotate k by 3 rad:  [-sin3, cos3]   = [-0.14112, -0.98999]
+dot product:  0.28366*(-0.14112) + (-0.95892)*(-0.98999)
+           = -0.04003 + 0.94933   =  0.90930
+
+now the claim: this should equal q rotated by (n - m) = -2, dotted with k unrotated
+rotate k by -2 rad: [-sin(-2), cos(-2)] = [0.90930, -0.41615]
+q &middot; that = 1*0.90930 + 0*(-0.41615) =  0.90930      identical</pre>
+<p style="margin-bottom:0">Positions 5 and 3 give the same score as positions 100 and 98. Only the
+distance survives.</p>
+</div>
+
+<h3>2.3 The KV cache size formula</h3>
+<p>During decode you keep every past K and V so you never recompute them. The size is:</p>
+<pre>KV bytes = 2 (K and V) x layers x kv_heads x head_dim x bytes_per_element x seq_len x batch</pre>
+
+<div class="ex"><span class="lbl">Example 2-B: bytes per token for this model</span>
+<pre>2 x 28 layers x 2 kv_heads x 128 head_dim x 2 bytes = 28,672 bytes = 28 KB per token</pre>
+<p style="margin-bottom:0">Note which head count is used: <b>2 KV heads, not 12 query heads</b>. That
+single substitution is the whole GQA result.</p>
+</div>
+
+<h3>2.4 MHA, MQA, GQA</h3>
+<table>
+<tr><th>Scheme</th><th>KV heads</th><th>Bytes / token</th><th>vs MHA</th><th>Trade</th></tr>
+<tr><td>MHA (all heads have their own K,V)</td><td>12</td><td>172,032 B = 168 KB</td><td>1x</td>
+<td>Best quality, worst memory</td></tr>
+<tr><td>GQA (groups share K,V) &mdash; <b>this model</b></td><td>2</td><td>28,672 B = 28 KB</td>
+<td><b>6x smaller</b></td><td>Near-MHA quality</td></tr>
+<tr><td>MQA (all heads share one K,V)</td><td>1</td><td>14,336 B = 14 KB</td><td>12x smaller</td>
+<td>Measurable quality loss</td></tr>
+</table>
+
+<div class="key"><b>Why GQA shrinks the cache but not the weights.</b> GQA reduces the number of
+<i>K and V</i> heads. The 12 query heads stay, the output projection stays, and the whole MLP, which
+is most of the parameters, is untouched. The K and V projection matrices do shrink, but they are a
+small slice of the model. So the weights barely move while the per-token cache drops 6x. The KV cache
+grows with sequence length and batch size, the weights do not, so shrinking the growing term is what
+matters for serving.</div>
+
+<h3>2.5 The measured consequence: the OOM cliff</h3>
+<p>The experiment in this repo grew the context one token at a time on the HuggingFace path until the
+card died. The full write-up is <code>docs/oom-results.md</code>.</p>
+<table>
+<tr><th>Quantity</th><th>Value</th></tr>
+<tr><td>Context length at OOM</td><td><b>123,565 tokens</b></td></tr>
+<tr><td>Weights resident</td><td>2945 MiB</td></tr>
+<tr><td>Peak allocated at OOM</td><td>10,437 MiB</td></tr>
+<tr><td>Peak reserved at OOM</td><td>11,764 MiB (card total 12,288 MiB)</td></tr>
+<tr><td>Predicted slope (formula above)</td><td>28 KB / token</td></tr>
+<tr><td>Measured slope</td><td><b>~60 KB / token, about 2.15x the prediction</b></td></tr>
+</table>
+<p>The 2x is not noise, and finding its cause is the interesting part. HuggingFace grows the cache
+with <code>torch.cat([old_cache, new_kv])</code> on every single token. A tensor cannot grow in
+place, so <code>cat</code> allocates a fresh contiguous block for <i>n+1</i> tokens and copies the
+old <i>n</i> across. For the duration of the copy, both caches are live.</p>
+<div class="ex"><span class="lbl">Example 2-C: the 2x KV model, checked at 120k tokens</span>
+<pre>analytical KV       28,672 x 120,000     = 3.28 GiB = 3281 MiB
+weights + 1 x KV    2945 + 3281          = 6226 MiB     (textbook answer, wrong)
+weights + 2 x KV    2945 + 2 x 3281      = 9507 MiB     (reallocation model)
+measured allocated                       = 10,226 MiB   (+~700 MiB attention scratch)
+
+slope check: d/dn (weights + 2 KV) = 2 x 28 KB = 56 KB/token   vs  ~60 measured</pre>
+</div>
+<p>Two more results worth carrying into an interview:</p>
+<ul class="tight">
+<li><b>The crash is fragmentation, not exhaustion.</b> At OOM, 10,437 MiB was allocated but 11,764
+MiB was reserved. About 1.3 GiB was free inside the pool and could not be handed out, because the
+next <code>cat</code> needed one contiguous slab and the free space was scattered in gaps between
+parked blocks.</li>
+<li><b>Decode slows 10x as context grows</b>, from ~30 tok/s to ~3 tok/s. Three costs grow with
+context: reading the whole cache for attention (28 KB x n), the <code>cat</code> copy (about
+2 x 28 KB x n), and nothing else. Past roughly 10k tokens these overtake the fixed 3 GB weight
+read.</li>
+</ul>
+<div class="key"><b>This is exactly what PagedAttention removes.</b> vLLM appends new tokens into
+pre-allocated fixed-size blocks. No <code>cat</code>, no second copy, no contiguity requirement, so no
+fragmentation wall. Measured on the same card: vLLM held <b>237,376 tokens</b> of real KV in 6.34 GiB.
+The HuggingFace path effectively pays for every token twice.</div>
+
+<p class="links"><b>Sources:</b>
+<a href="https://arxiv.org/abs/2104.09864">Su et al., RoFormer (RoPE)</a> &middot;
+<a href="https://blog.eleuther.ai/rotary-embeddings/">EleutherAI, Rotary Embeddings: A Relative Revolution</a> &middot;
+<a href="https://arxiv.org/abs/2305.13245">Ainslie et al., GQA</a> &middot;
+<a href="https://arxiv.org/abs/1911.02150">Shazeer, Fast Transformer Decoding (MQA)</a> &middot;
+<a href="https://arxiv.org/abs/2309.06180">Kwon et al., PagedAttention / vLLM</a></p>
+
+<!-- ===================== DAY 3 ===================== -->
+<h2 class="day">Day 3 &nbsp;&middot;&nbsp; The GPU, in the terms that decide performance</h2>
+
+<h3>3.1 Three numbers describe a GPU</h3>
+<table>
+<tr><th>Property</th><th>RTX 3060 12GB</th><th>What it limits</th></tr>
+<tr><td>Compute throughput</td><td>~51 TFLOPS fp16 on tensor cores</td><td>How fast you can do
+arithmetic</td></tr>
+<tr><td>Memory bandwidth</td><td>360 GB/s theoretical, <b>291.5 GB/s measured</b> (81%)</td>
+<td>How fast you can feed the arithmetic</td></tr>
+<tr><td>Memory capacity</td><td>12,288 MiB</td><td>What fits at all</td></tr>
+</table>
+<p>The measured 291.5 GB/s comes from <code>scripts/measure_bandwidth.py</code> on this box, a large
+streaming read. Always compare against the achievable figure, not the spec sheet, or every efficiency
+number you quote is 19% too pessimistic.</p>
+
+<h3>3.2 How the chip is organised</h3>
+<ul class="tight">
+<li><b>SM (Streaming Multiprocessor)</b>: the independent unit of the GPU. This card has 28 of them.
+Each has its own registers, its own on-chip shared memory, and its own schedulers.</li>
+<li><b>Thread</b>: one lane of execution. You launch thousands.</li>
+<li><b>Warp</b>: 32 threads that execute the same instruction at the same time, always. This is the
+real unit of scheduling. If threads inside one warp take different branches, the warp runs both sides
+one after the other with half the lanes idle. That is <b>warp divergence</b>.</li>
+<li><b>Block</b>: a group of warps assigned to one SM. Threads in a block can share data through that
+SM's shared memory.</li>
+<li><b>Tensor core</b>: dedicated hardware that does a small matrix multiply-accumulate in one
+instruction. This is where the 51 TFLOPS lives. Ordinary FP32 arithmetic on this card is roughly
+13 TFLOPS, about 4x slower. If your kernel does not hit tensor cores, you are not on the
+compute ceiling you think you are.</li>
+</ul>
+
+<h3>3.3 The memory hierarchy</h3>
+<pre>                       size (per SM unless noted)   relative latency
+registers              256 KB                        ~1 cycle
+shared memory / L1     up to 128 KB                  ~30 cycles
+L2 cache               3 MB (whole chip)             ~200 cycles
+global memory (VRAM)   12,288 MiB                    ~400-600 cycles</pre>
+<p>Every step down is roughly an order of magnitude more capacity and an order of magnitude more
+latency. Optimising GPU code is almost always the act of moving a working set one level up this
+table and reusing it there.</p>
+
+<div class="ex"><span class="lbl">Example 3-A: why 3 MB of L2 does not save you</span>
+<pre>weights that must be read for one decode step  = 3.09 GB
+L2 cache                                       = 0.003 GB
+
+3.09 / 0.003 = ~1000x too big to cache</pre>
+<p style="margin-bottom:0">Every decode step reads the full weight set from VRAM. There is no cache
+trick available. The only escape is to make that one read serve more work, which is what batching
+does.</p>
+</div>
+
+<h3>3.4 Coalescing</h3>
+<p>The memory system does not serve individual addresses. It serves fixed transactions, typically 32
+bytes. When the 32 threads of a warp read 32 consecutive 4-byte floats, that is 128 contiguous bytes
+and the hardware serves it in 4 transactions. If those same 32 threads read 32 addresses scattered
+across VRAM, it takes 32 transactions and you have thrown away most of the bandwidth you paid for.</p>
+<div class="ex"><span class="lbl">Example 3-B: coalesced vs strided, same 32 values</span>
+<pre>coalesced   thread i reads addr[i]          128 bytes wanted, 128 fetched   100% useful
+strided     thread i reads addr[i * 64]     128 bytes wanted, 1024 fetched  12.5% useful
+
+on this card: 291.5 GB/s achievable  ->  ~36 GB/s effective, an 8x loss</pre>
+</div>
+<p>This is why memory layout is a first-class concern, and why the KV cache layout inside a serving
+engine is chosen so that the attention kernel reads it contiguously.</p>
+
+<h3>3.5 Occupancy and latency hiding</h3>
+<p>A VRAM read takes 400 to 600 cycles. The GPU does not try to make that faster. It hides it: when a
+warp stalls on memory, the SM instantly switches to another resident warp. With enough resident warps
+there is always something to run and the stall never shows.</p>
+<p><b>Occupancy</b> is the fraction of the maximum resident warps per SM that your kernel actually
+achieves. It is limited by registers per thread and shared memory per block: use too much of either
+and fewer blocks fit on an SM at once.</p>
+<div class="key"><b>The correction that matters:</b> high occupancy is not the goal, hiding latency
+is. A kernel at 25% occupancy with plenty of independent work in flight can beat a kernel at 100%
+occupancy that stalls. Occupancy is a means, not a metric to maximise.</div>
+
+<h3>3.6 Arithmetic intensity and the ridge point</h3>
+<p>This is the most important idea in the whole week. For any piece of work, define:</p>
+<pre>arithmetic intensity = FLOPs performed / bytes moved      (unit: FLOP/byte)</pre>
+<p>The hardware has a break-even intensity where the compute ceiling and the bandwidth ceiling cross.
+That is the <b>ridge point</b>.</p>
+<div class="ex"><span class="lbl">Example 3-C: the ridge point of this card</span>
+<pre>51e12 FLOP/s / 360e9 byte/s = 142 FLOP/byte
+
+below 142  ->  memory-bound.  You finish the maths and wait for data. Faster arithmetic
+               changes nothing. Move fewer bytes.
+above 142  ->  compute-bound. Data arrives faster than you can use it. Better kernels and
+               tensor cores help.</pre>
+</div>
+<p>Every optimisation in LLM serving is a statement about which side of 142 you are on. Day 4 places
+prefill and decode on that axis with measured numbers.</p>
+
+<p class="links"><b>Sources:</b>
+<a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/">CUDA C++ Programming Guide</a> &middot;
+<a href="https://siboehm.com/articles/22/CUDA-MMM">Boehm, How to optimize a CUDA matmul kernel</a> &middot;
+<a href="https://horace.io/brrr_intro.html">Horace He, Making Deep Learning Go Brrrr From First Principles</a> &middot;
+<a href="https://docs.nvidia.com/deeplearning/performance/dl-performance-gpu-background/">NVIDIA, GPU Performance Background</a></p>
+
+<!-- ===================== DAY 4 ===================== -->
+<h2 class="day">Day 4 &nbsp;&middot;&nbsp; Prefill vs decode, on the roofline, with measured numbers</h2>
+
+<h3>4.1 The two phases are different shapes of matrix multiply</h3>
+<table>
+<tr><th></th><th>Prefill</th><th>Decode</th></tr>
+<tr><td>Tokens per pass</td><td>512 (the prompt)</td><td>1</td></tr>
+<tr><td>Operation</td><td>GEMM, matrix x matrix</td><td>GEMV, vector x matrix</td></tr>
+<tr><td>Weight bytes read</td><td>3.09 GB, once, for 512 tokens</td><td>3.09 GB, once, per token</td></tr>
+<tr><td>Arithmetic intensity</td><td>hundreds of FLOP/byte</td><td>about 1-2 FLOP/byte</td></tr>
+<tr><td>Side of the 142 ridge</td><td>compute-bound</td><td><b>far into memory-bound</b></td></tr>
+</table>
+<p>The same weights, the same kernels, and a thousandfold difference in efficiency. That is the
+central fact of inference optimisation. Decode reads the entire model to produce one token.</p>
+
+<h3>4.2 Measured prefill: compute-bound, at 23% of the ceiling</h3>
+<div class="ex"><span class="lbl">Example 4-A: prefill against the compute ceiling</span>
+<pre>FLOPs for a forward pass ~= 2 x params x tokens
+   = 2 x 1.544e9 x 512      = 1.58e12 FLOP
+floor at 51 TFLOPS          = 1.58e12 / 51e12 = 31 ms
+measured (HuggingFace)      = 137 ms     ->  11.5 TFLOPS effective, 23% of peak
+measured (vLLM)             = 124 ms     ->  25% of peak, only 1.1x better</pre>
+</div>
+<p>The "2 x params" rule comes from every weight being touched once, with one multiply and one add per
+weight. It counts linear layers only and ignores the attention term that grows as
+<code>seq&sup2;</code>, which is fine at 512 tokens (about 3% extra) and wrong past a few thousand.</p>
+<p><b>Read the vLLM number carefully.</b> vLLM barely beats HuggingFace at prefill, and that is the
+expected answer, not a disappointment. Both hand the same GEMMs to the same cuBLAS tensor-core
+kernels. There is no algorithm to beat. Prefill is already near the ceiling, so this is where a fast
+engine has the least to offer.</p>
+
+<h3>4.3 Measured decode: memory-bound, and the number to quote is MBU</h3>
+<p>For a memory-bound phase, the right efficiency metric is not FLOPS but <b>memory bandwidth
+utilisation</b>: the bytes you actually moved per second, divided by the bytes the card can move.</p>
+<div class="ex"><span class="lbl">Example 4-B: decode against the bandwidth ceiling</span>
+<pre>bytes that must move per decode token = 3.09 GB (the weights)
+
+vLLM   79.9 tok/s -> 12.5 ms/token -> 3.09 GB / 0.0125 s = 247 GB/s -> 85% of 291.5 achievable
+HF     ~20 tok/s  -> ~50 ms/token  -> 3.09 GB / 0.050 s  =  62 GB/s -> ~21% of achievable
+
+theoretical ceiling: 291.5 GB/s / 3.09 GB = 94 tok/s, whatever software you write</pre>
+</div>
+<div class="key"><b>The sentence to be able to say.</b> vLLM is at 85% of this card's achievable read
+bandwidth at batch 1. It is close to the hardware limit, so no further kernel work will help at
+batch 1. The only ways past 94 tok/s are to move fewer bytes (quantisation) or to serve more tokens
+per byte read (batching).</div>
+
+<h3>4.4 So where did HuggingFace lose the other 60 tok/s?</h3>
+<p>The obvious guess is slow kernels. The measurement says otherwise. Both engines were profiled per
+decode step (<code>docs/profiling.md</code>), separating time the GPU spent computing from time it
+spent idle waiting for the CPU to hand it the next kernel.</p>
+<table>
+<tr><th>Run</th><th>GPU kernels / step</th><th>CPU launches / step</th><th>GPU busy</th>
+<th>Step time</th><th>Idle</th></tr>
+<tr><td>HuggingFace</td><td>1198</td><td>1198</td><td>15.31 ms</td><td>40.65 ms</td>
+<td><b>25.34 ms (62%)</b></td></tr>
+<tr><td>vLLM, eager</td><td>356</td><td>356</td><td>13.02 ms</td><td>25.22 ms</td><td>12.20 ms (48%)</td></tr>
+<tr><td>vLLM, compile only</td><td>354</td><td>354</td><td>12.90 ms</td><td>22.41 ms</td><td>9.51 ms (42%)</td></tr>
+<tr><td><b>vLLM, CUDA graphs</b></td><td>383</td><td><b>17</b></td><td>12.71 ms</td><td>12.56 ms</td>
+<td><b>~0 ms (0%)</b></td></tr>
+</table>
+<div class="ex"><span class="lbl">Example 4-C: split the win into its two causes</span>
+<pre>total saved per token   40.65 - 12.56 = 28.09 ms
+
+idle time removed       25.34 - 0.00  = 25.34 ms   =  90% of the win
+faster device work      15.31 - 12.71 =  2.60 ms   =   9% of the win</pre>
+</div>
+<div class="key"><b>The result.</b> 90% of vLLM's batch-1 decode advantage is removed idle time, not
+faster kernels. HuggingFace re-enters Python 1198 times per token to launch 1198 tiny kernels. Each
+kernel finishes before the CPU can submit the next, so the GPU sits idle 62% of the step. This is a
+scheduling problem wearing a performance problem's clothes.</div>
+
+<h3>4.5 What CUDA graphs actually do</h3>
+<p>Look at the last row of the table again. Kernel count went <i>up</i> slightly, from 356 to 383.
+Busy time barely moved. What collapsed was CPU launches: 356 down to 17, because the entire decode
+step is recorded once as a graph and then replayed with a single call. Same kernels, same order, same
+compiled code. The CPU is simply no longer in the loop, and the gaps close as a consequence.</p>
+<p>A second measured result, which was not predicted: <code>torch.compile</code> saves 2.81 ms per
+step when CUDA graphs are off, and 0.01 ms when they are on. The two optimisations are not additive
+because they attack the same term, launch overhead. Once graphs have removed it there is nothing left
+for compilation to remove.</p>
+
+<h3>4.6 Batching, in one paragraph, because it follows directly</h3>
+<p>At batch 1 the decode GEMV reads all 3.09 GB of weights to advance one sequence by one token, and
+the tensor cores are nearly idle. Add a second sequence and the same weight read serves two rows. The
+bytes do not change, the useful work doubles, and arithmetic intensity rises. So throughput climbs
+almost linearly while per-token latency barely moves. This is the free region. It ends when the
+batched GEMM is finally wide enough to saturate the tensor cores, at which point you have crossed the
+142 FLOP/byte ridge, every extra sequence costs real compute, and latency starts to climb. The
+throughput knee in <code>results/vllm_batch_sweep.csv</code> is that crossing, measured.</p>
+
+<h3>4.7 Week 1 exit bar</h3>
+<p>Unaided, out loud, under 90 seconds each:</p>
+<ol class="tight">
+<li>Whiteboard the attention formula and derive why the scores are divided by
+<code>sqrt(d_head)</code>.</li>
+<li>State the KV cache size formula and compute 28 KB/token for this model, then say why the 2 KV
+heads and not the 12 query heads appear in it.</li>
+<li>Show that a RoPE score depends only on <code>m - n</code>.</li>
+<li>Compute the ridge point as 142 FLOP/byte and place prefill and decode either side of it.</li>
+<li>Explain the 123,565-token OOM cliff, including why the measured slope was 60 KB/token and not
+28.</li>
+<li>Explain the HF-to-vLLM decode gap as 90% idle time and 9% faster kernels, and say what CUDA
+graphs changed.</li>
+</ol>
+
+<h3>4.8 Self-test</h3>
+<p><b>Q1. Why does GQA shrink the KV cache but not the weights?</b><br>
+The cache is sized by KV heads (2 here), which GQA cuts. The weights are dominated by the MLP and the
+12 query projections, which GQA does not touch. 6x smaller cache, roughly unchanged parameter count.</p>
+<p><b>Q2. Softmax needs the whole row for its denominator, so how can attention ever be tiled?</b><br>
+Keep a running maximum and a running sum. When a new tile contains a larger maximum, rescale the
+accumulated result by <code>exp(old_max - new_max)</code> and carry on. The answer is exact, not an
+approximation. That is online softmax, and it is what makes FlashAttention possible.</p>
+<p><b>Q3. Your GPU has 51 TFLOPS. Why is your decode at 20 tok/s?</b><br>
+Because decode does not use FLOPS. It moves 3.09 GB of weights per token at an arithmetic intensity
+of roughly 1 FLOP/byte, far below the 142 FLOP/byte ridge. The binding limit is 291.5 GB/s of
+bandwidth, which caps the model at 94 tok/s at batch 1, and HuggingFace only reached 21% of that
+because the GPU was idle 62% of every step.</p>
+<p><b>Q4. Walk me through a memory problem you have debugged.</b><br>
+The OOM sweep. Predicted 28 KB/token, measured 60. The cause was HuggingFace's per-token
+<code>torch.cat</code> keeping the old and new cache live at once, which makes the real slope
+2 x 28 = 56 KB/token, plus attention scratch. The crash itself was fragmentation: 10,437 MiB
+allocated against 11,764 MiB reserved, so 1.3 GiB was free but not contiguous. PagedAttention removes
+both effects, and vLLM held 237,376 tokens in 6.34 GiB on the same card.</p>
+
+<p class="links"><b>Sources:</b>
+<a href="https://arxiv.org/abs/2211.05102">Pope et al., Efficiently Scaling Transformer Inference</a> &middot;
+<a href="https://kipp.ly/transformer-inference-arithmetic/">kipply, Transformer Inference Arithmetic</a> &middot;
+<a href="https://www.usenix.org/conference/osdi22/presentation/yu">Yu et al., Orca (continuous batching)</a> &middot;
+<a href="https://developer.nvidia.com/blog/cuda-graphs/">NVIDIA, Getting Started with CUDA Graphs</a></p>
+
+<hr>
+<p class="small">Repo sources for every measured number above: <code>docs/baseline-hf-results.md</code>,
+<code>docs/baseline-vllm-results.md</code>, <code>docs/oom-results.md</code>,
+<code>docs/profiling.md</code>, <code>docs/batching-results.md</code>,
+<code>results/profile_summary.csv</code>.</p>
