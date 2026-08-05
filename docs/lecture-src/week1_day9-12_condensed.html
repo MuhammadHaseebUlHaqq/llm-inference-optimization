@@ -1,0 +1,438 @@
+<meta charset="utf-8">
+<title>Days 9-12: Online Softmax, FlashAttention, Flash-Decoding, Continuous Batching</title>
+<style>
+@page { size: A4; margin: 14mm 15mm 14mm 15mm; }
+* { box-sizing: border-box; }
+body { font-family: "Charter", "Georgia", serif; font-size: 10.2pt; line-height: 1.38; color: #16181d; }
+h1 { font-size: 19pt; margin: 0 0 2px 0; line-height: 1.15; }
+h2 { font-size: 13pt; margin: 16px 0 6px 0; padding: 4px 0 4px 8px;
+     border-left: 4px solid #2b5fa8; background: #eef2f8; page-break-after: avoid; }
+h3 { font-size: 11pt; margin: 11px 0 4px 0; color: #1c3f70; page-break-after: avoid; }
+p { margin: 5px 0; }
+ul, ol { margin: 5px 0 5px 0; padding-left: 19px; }
+li { margin: 2px 0; }
+code, pre { font-family: "Consolas", "DejaVu Sans Mono", monospace; }
+code { font-size: 9pt; background: #f2f3f5; padding: 0 2px; border-radius: 2px; }
+pre { font-size: 8.6pt; background: #f7f8fa; border: 1px solid #dde1e8; border-radius: 3px;
+      padding: 6px 8px; margin: 6px 0; line-height: 1.32; white-space: pre-wrap;
+      overflow-x: auto; page-break-inside: avoid; }
+table { border-collapse: collapse; width: 100%; margin: 6px 0; font-size: 9.2pt;
+        page-break-inside: avoid; }
+th, td { border: 1px solid #ccd2dc; padding: 3px 6px; text-align: left; vertical-align: top; }
+th { background: #eef2f8; font-weight: 600; }
+.sub { color: #55606f; font-size: 10pt; margin: 0 0 10px 0; }
+.ex { border: 1px solid #b9cbe4; background: #f4f8fd; border-radius: 3px;
+      padding: 6px 9px; margin: 7px 0; page-break-inside: avoid; }
+.ex .lbl { font-family: Consolas, monospace; font-size: 8.4pt; font-weight: 700;
+           letter-spacing: .04em; color: #2b5fa8; text-transform: uppercase; display: block;
+           margin-bottom: 3px; }
+.key { border-left: 3px solid #c58b00; background: #fdf7e8; padding: 5px 9px; margin: 7px 0;
+       page-break-inside: avoid; }
+.key b { color: #8a6100; }
+a { color: #2b5fa8; text-decoration: none; }
+.links { font-size: 8.9pt; color: #55606f; margin: 5px 0 0 0; }
+.day { page-break-before: always; }
+.tight li { margin: 1px 0; }
+hr { border: 0; border-top: 1px solid #dde1e8; margin: 14px 0 0 0; }
+.small { font-size: 9pt; color: #55606f; }
+</style>
+
+<h1>Days 9-12</h1>
+<p class="sub">Online softmax, FlashAttention, flash-decoding, and continuous batching. Continues the
+Days 1-4 and Days 5-8 notes. Same model and card: Qwen2.5-1.5B, fp16, one RTX 3060 12GB.</p>
+
+<table>
+<tr><th>Day</th><th>Topic</th><th>The one thing you must be able to derive</th></tr>
+<tr><td>9</td><td>Online softmax</td><td>The running-max rescale recurrence, cold, on a blank page</td></tr>
+<tr><td>10</td><td>FlashAttention</td><td>Why it is an IO win and not a FLOPs win</td></tr>
+<tr><td>11</td><td>Flash-decoding</td><td>Why FlashAttention does nothing at batch 1, and what does</td></tr>
+<tr><td>12</td><td>Continuous batching</td><td>Your two measured plateaus, and which ceiling caused each</td></tr>
+</table>
+
+<div class="key"><b>Why these four days carry more weight than any others.</b> FlashAttention is the
+single most likely deep-dive question in a systems interview, and it is the one anchor answer this
+repo <b>cannot</b> support with a measurement. The derivation has to carry it. So Day 9 is not
+background for Day 10, it <i>is</i> the answer: if you can write the recurrence unaided, the rest of
+FlashAttention is a paragraph of consequences.</div>
+
+<!-- ===================== DAY 9 ===================== -->
+<h2>Day 9 &nbsp;&middot;&nbsp; Online softmax: computing a softmax you cannot see all of</h2>
+
+<h3>9.1 The problem</h3>
+<p>Softmax needs a denominator that sums over the whole row. Written naively that means you must hold
+the entire row of scores before you can normalise any of it. For a 4096-token sequence that row is
+4096 numbers per query, per head, and the full score matrix does not fit in on-chip memory. So the
+standard implementation writes it to VRAM and reads it back.</p>
+<p>The question this day answers: <b>can you produce the exact softmax-weighted output while only ever
+seeing one tile of the row at a time?</b> The answer is yes, exactly, with no approximation. That fact
+is what FlashAttention is built on.</p>
+
+<h3>9.2 The recurrence</h3>
+<p>Recall the max-subtraction trick from Day 1: subtracting a constant from every score leaves softmax
+unchanged. Online softmax exploits that in the other direction. Process tiles in order, keeping a
+<i>running</i> maximum. When a later tile contains a bigger maximum, every quantity accumulated so far
+was normalised against the wrong constant, so you rescale it by a single correction factor and carry
+on.</p>
+<p>Carry three running values: <code>m</code> the max seen so far, <code>l</code> the sum of
+exponentials, and <code>O</code> the accumulated weighted values. For a new tile of scores
+<code>s</code> with values <code>v</code>:</p>
+<pre>m_new = max(m_old, max(s))
+c     = exp(m_old - m_new)                    the correction factor, always in (0, 1]
+
+l_new = l_old * c + sum_j exp(s_j - m_new)
+O_new = O_old * c + sum_j exp(s_j - m_new) * v_j
+
+at the end:  output = O_final / l_final</pre>
+<p>That is the whole thing. Two accumulators get multiplied by the same scalar <code>c</code> whenever
+the max moves. Everything else is the ordinary softmax you already know.</p>
+
+<div class="ex"><span class="lbl">Example 9-A: the recurrence, worked, and checked against the direct answer</span>
+<pre>scores s = [1, 3, 2, 5]   values v = [10, 20, 30, 40]   processed as two tiles
+
+TILE 1: s = [1, 3]
+  m = 3
+  exp(1-3) = 0.135335    exp(3-3) = 1.000000
+  l = 0.135335 + 1.000000                       = 1.135335
+  O = 0.135335*10 + 1.000000*20                 = 21.353350
+
+TILE 2: s = [2, 5]     max of tile is 5, which is bigger than m = 3
+  m_new = 5
+  c     = exp(3 - 5) = 0.135335                 <- rescale everything so far
+  exp(2-5) = 0.049787    exp(5-5) = 1.000000
+  l = 1.135335*0.135335 + (0.049787 + 1.000000) = 1.203438
+  O = 21.353350*0.135335 + (0.049787*30 + 40)   = 44.383460
+
+  output = 44.383460 / 1.203438 = 36.8812
+
+DIRECT CHECK, all four at once with global max 5:
+  weights   = [exp(-4), exp(-2), exp(-3), exp(0)]
+            = [0.018316, 0.135335, 0.049787, 1.000000]   sum = 1.203438   MATCHES l
+  weighted  = 0.18316 + 2.70670 + 1.49361 + 40.0 = 44.383470   MATCHES O
+  output    = 36.8812                                          IDENTICAL</pre>
+</div>
+
+<div class="key"><b>Say this out loud.</b> The two results are identical, not close. Online softmax is
+exact. It is not a numerical approximation, an estimate, or a trade of accuracy for speed. Every
+FlashAttention output is bit-comparable to the standard implementation up to floating-point
+associativity. Interviewers probe this because a lot of people assume there must be a quality cost.</div>
+
+<h3>9.3 Why the correction factor is always safe</h3>
+<p><code>c = exp(m_old - m_new)</code> and <code>m_new &gt;= m_old</code> by construction, so the
+exponent is zero or negative and <code>c</code> lands in <code>(0, 1]</code>. It can never overflow.
+Every <code>exp(s_j - m_new)</code> is likewise bounded above by 1. The recurrence is numerically
+safer than the naive version, not riskier, which is worth saying because it sounds like it should be
+the opposite.</p>
+
+<p class="links"><b>Sources:</b>
+<a href="https://arxiv.org/abs/1805.02867">Milakov &amp; Gimelshein, Online normalizer calculation for softmax</a> &middot;
+<a href="https://arxiv.org/abs/2205.14135">Dao et al., FlashAttention</a> (Algorithm 1 is this recurrence)</p>
+
+<!-- ===================== DAY 10 ===================== -->
+<h2 class="day">Day 10 &nbsp;&middot;&nbsp; FlashAttention: the same FLOPs, far fewer bytes</h2>
+
+<h3>10.1 What the standard implementation actually does to memory</h3>
+<p>Standard attention is four steps, and three of them round-trip through VRAM:</p>
+<pre>S = Q K&#7488;          write S to HBM        [N, N]
+P = softmax(S)     read S, write P       [N, N]
+O = P V            read P                [N, d]</pre>
+<p>The N-by-N score matrix is never wanted afterwards. It exists only to be consumed by the next
+operation. But it is too large for on-chip memory, so it is written out and read back, twice.</p>
+
+<div class="ex"><span class="lbl">Example 10-A: the cost of that round trip, on your own config</span>
+<pre>prefill, 512 tokens, 12 heads, head_dim 128, fp16, ONE layer
+
+score matrix per head  512 x 512 x 2 B          =   512 KiB
+x 12 heads                                       =     6 MiB
+traffic: write S, read S, write P, read P        =    24 MiB
+
+the actual inputs, for comparison:
+Q, K, V each 512 x 1536 x 2 B = 1.5 MiB, three   =   4.5 MiB
+
+so 24 MiB of traffic on a throwaway intermediate against 4.5 MiB of real input,
+a 5.3x overhead, per layer, x 28 layers = 672 MiB per prefill
+
+and it is QUADRATIC. at 4096 tokens, same model:
+score matrix per layer  4096 x 4096 x 2 x 12     =   384 MiB
+traffic per layer                                =   1.5 GiB
+x 28 layers                                      =    43 GiB
+time at 291.5 GB/s                               =   148 ms
+
+148 ms of moving a matrix that gets thrown away.</pre>
+</div>
+
+<h3>10.2 What FlashAttention changes</h3>
+<p>It never materialises S. Q, K and V are cut into tiles small enough to fit in an SM's shared
+memory. For each tile of queries, it loops over tiles of keys and values, computes that small block of
+scores <i>inside SRAM</i>, and folds it into the running <code>(m, l, O)</code> using the Day 9
+recurrence. The block of scores is discarded before the next one is computed. Only Q, K, V and the
+final O ever touch VRAM.</p>
+<pre>for each tile of Q:
+    m, l, O = -inf, 0, 0
+    for each tile of K, V:
+        load K_tile, V_tile into SRAM
+        s = Q_tile K_tile&#7488;         <- lives and dies in SRAM
+        apply the online softmax update to (m, l, O)
+    write O_tile / l to HBM</pre>
+<div class="key"><b>The sentence that gets this right.</b> FlashAttention does <b>not</b> reduce FLOPs.
+It performs the same <code>2 N&sup2; d</code> multiply-accumulates for <code>QK&#7488;</code> and the
+same again for <code>PV</code>, and in the backward pass it deliberately <i>recomputes</i> the scores
+rather than storing them, so it does strictly more arithmetic. It is faster because attention was
+never limited by arithmetic. It is IO-aware: it changes what crosses the HBM boundary. Anyone who
+says "FlashAttention makes attention O(N) instead of O(N&sup2;)" has it wrong. The compute is still
+quadratic. The <i>memory</i> is linear.</div>
+
+<h3>10.3 Why the tiling is possible at all</h3>
+<p>Two properties have to hold together, and this is the connection an interviewer is looking for:</p>
+<ol class="tight">
+<li><b>Online softmax</b> (Day 9) means the row denominator does not have to be known in advance. This
+is the mathematical permission to tile.</li>
+<li><b>Multi-head attention</b> (Day 1) means each head's score block is small. With head_dim 128 and
+a block of 64 queries by 128 keys, the tile is a few tens of KiB, which fits in the up-to-128 KiB of
+shared memory per SM. This is the hardware permission to tile.</li>
+</ol>
+<p>Remove either one and the technique collapses. That is why the Day 1 remark that "multi-head is
+free" has a second payoff here.</p>
+
+<h3>10.4 FlashAttention-2, in one paragraph</h3>
+<p>FA1 was already IO-optimal in the sense that mattered, so FA2 attacks occupancy instead. It reduces
+the number of non-matmul operations (which run far slower than tensor-core matmuls, so they cost more
+wall clock than their FLOP count suggests), it parallelises over the sequence-length dimension rather
+than only over batch and heads (so a single long sequence can fill the SMs), and it splits work
+between warps to cut shared-memory synchronisation. Result is roughly 2x over FA1 with no change to
+the mathematics. Note that all three of those are Day 3 concepts: occupancy, latency hiding, warp
+scheduling.</p>
+
+<p class="links"><b>Sources:</b>
+<a href="https://arxiv.org/abs/2205.14135">Dao et al., FlashAttention</a> &middot;
+<a href="https://arxiv.org/abs/2307.08691">Dao, FlashAttention-2</a> &middot;
+<a href="https://github.com/Dao-AILab/flash-attention">flash-attention repo</a></p>
+
+<!-- ===================== DAY 11 ===================== -->
+<h2 class="day">Day 11 &nbsp;&middot;&nbsp; Flash-decoding: what to do when the query length is 1</h2>
+
+<h3>11.1 FlashAttention does nothing for batch-1 decode. Two independent reasons.</h3>
+<p>This is the follow-up question after the FA derivation, and it separates people who read the paper
+from people who understood it.</p>
+<div class="ex"><span class="lbl">Example 11-A: the decode score matrix is not a matrix</span>
+<pre>prefill, 512 tokens:   S is [512, 512] = 262,144 scores    <- the thing FA avoids writing
+decode, one token:     S is [1, n]                          <- a single row
+
+at n = 512:  1 x 512 x 2 B = 1 KiB.  It fits in registers.</pre>
+</div>
+<ol class="tight">
+<li><b>There is nothing to avoid materialising.</b> The intermediate FA exists to keep out of HBM is
+1 KiB. There is no quadratic term, because the query dimension is 1. FA's entire saving is zero
+here.</li>
+<li><b>The parallelism disappears.</b> FA1 and FA2 assign work by splitting the query dimension across
+thread blocks. With one query there is one block per (head, batch). At batch 1 that is 12 blocks of
+work for <b>28 SMs</b>. More than half the GPU is idle by construction.</li>
+</ol>
+<p>And the actual cost of decode attention is neither of those: it is reading the KV cache. At 512
+context this model reads <code>512 x 28 KiB = 14 MiB</code> of cache per step, and no amount of tiling
+reduces that. You must read every key and value to attend to them.</p>
+
+<h3>11.2 The fix: split along the KV sequence instead</h3>
+<p>Flash-decoding, also called split-KV, changes which axis is partitioned. Cut the KV cache into
+chunks and give each chunk to a different SM. Each computes a <i>partial</i> attention output over its
+chunk and returns three things: its partial output, its running max <code>m</code>, and its running
+sum <code>l</code>. A second kernel then combines the partials.</p>
+<p>The combine step is the Day 9 recurrence again, applied across chunks instead of across tiles:</p>
+<pre>m = max over chunks of m_i
+O = sum_i O_i * exp(m_i - m)          l = sum_i l_i * exp(m_i - m)
+output = O / l</pre>
+<p>The same rescale, one level up. That is why online softmax is worth deriving properly: it appears
+twice, once inside the kernel and once across kernels.</p>
+
+<h3>11.3 This is in your own trace</h3>
+<p>From <code>results/trace_vllm-graph.json.gz</code>, one steady-state decode step of Qwen2.5-1.5B on
+the 3060:</p>
+<div class="ex"><span class="lbl">Example 11-B: flash-decoding, counted in your trace</span>
+<pre>flash::flash_fwd_splitkv_kernel            28 launches/step   14.7 - 15.1 us each
+flash::flash_fwd_splitkv_combine_kernel    28 launches/step    6.8 -  6.9 us each
+
+28 = one per layer. the split and the combine, exactly as described above.
+
+attention cost per step  = 28 x (15.0 + 6.85) us = 612 us = 0.61 ms
+whole decode step        = 12.56 ms
+attention share          = 4.9%</pre>
+</div>
+<div class="key"><b>The number that ties Days 9-11 to Days 5-8.</b> Attention is <b>5%</b> of a
+batch-1 decode step. The other 95% is streaming 3.09 GB of weights. So a perfect attention kernel
+would buy you 5% at best. This is the honest, quantified reason FlashAttention is not the answer to
+decode latency, and it is why the entire Week 1 roofline analysis pointed at weight bandwidth
+instead.</div>
+<p class="small">Method note: the trace also holds 28 longer split-KV launches (up to 122.9 us) from
+the first step, which includes prefill. Those are excluded above; the figures are steady-state decode
+only.</p>
+
+<h3>11.4 When each kernel is the right one</h3>
+<table>
+<tr><th>Regime</th><th>Query length</th><th>Bottleneck</th><th>Right kernel</th></tr>
+<tr><td>Prefill / training</td><td>N, large</td><td>Writing the N-by-N score matrix to HBM</td>
+<td>FlashAttention 1 / 2</td></tr>
+<tr><td>Decode, batch 1</td><td>1</td><td>Reading the KV cache, and idle SMs</td>
+<td>Flash-decoding (split-KV)</td></tr>
+<tr><td>Decode, large batch</td><td>1 per sequence, many sequences</td>
+<td>Weight bandwidth, amortised across the batch</td>
+<td>Batched attention; splitting matters less because batch already fills the SMs</td></tr>
+</table>
+
+<p class="links"><b>Sources:</b>
+<a href="https://pytorch.org/blog/flash-decoding/">Dao et al., Flash-Decoding for long-context inference</a> &middot;
+<a href="https://arxiv.org/abs/2307.08691">FlashAttention-2</a> &middot;
+<a href="https://arxiv.org/abs/2309.06180">PagedAttention</a></p>
+
+<!-- ===================== DAY 12 ===================== -->
+<h2 class="day">Day 12 &nbsp;&middot;&nbsp; Continuous batching, chunked prefill, and the vocabulary</h2>
+
+<h3>12.1 What static batching wastes</h3>
+<p>Group eight requests, run them together, return when all eight finish. The one that generates 500
+tokens holds the batch slot of the one that finished at 20. Those seven slots compute padding for the
+rest of the run. On real traffic, where output lengths vary by an order of magnitude, most of the
+batch is idle most of the time.</p>
+
+<h3>12.2 Continuous batching (Orca)</h3>
+<p>Orca's contribution is <b>iteration-level scheduling</b>. The scheduler runs between every decode
+step, not between batches:</p>
+<ol class="tight">
+<li>A sequence that emitted its stop token leaves the batch immediately, at the end of that step.</li>
+<li>A queued request takes the free slot at the start of the next step.</li>
+<li>No request waits for an unrelated request to finish.</li>
+</ol>
+<p>The second half of the paper is <b>selective batching</b>: the linear layers batch cleanly because
+every sequence contributes one token, but attention cannot, because each sequence has a different
+context length. So the runtime batches the linear layers and runs attention per sequence. That
+asymmetry is the same one from Day 1: the MLP treats tokens independently, attention does not.</p>
+
+<h3>12.3 Chunked prefill (Sarathi)</h3>
+<p>Prefill and decode compete for the same GPU, and they are the two regimes from Day 5. A 2000-token
+prefill is compute-bound and occupies the device for a long single step. Every decode in flight stalls
+behind it, so their TPOT spikes. Users see a stutter caused by someone else's prompt.</p>
+<p>Sarathi splits the prefill into fixed-size chunks and schedules one chunk per step, filling the rest
+of that step with decode tokens from running requests. The prefill takes marginally longer in total,
+but no single step is long, so TPOT stays flat. The trade is stated plainly: <b>slightly worse TTFT
+for the new request, much better TPOT for everyone already running.</b></p>
+
+<h3>12.4 The vocabulary, precisely</h3>
+<table>
+<tr><th>Term</th><th>Definition</th><th>Your measured value, batch 1</th></tr>
+<tr><td>TTFT</td><td>Time to first token: prefill plus the first sample</td><td>112 ms</td></tr>
+<tr><td>TPOT / ITL</td><td>Time per output token after the first</td><td>11.28 ms</td></tr>
+<tr><td>End-to-end</td><td><code>TTFT + TPOT x (out_tokens - 1)</code></td>
+<td>112 + 11.28 x 255 = 2989 ms</td></tr>
+<tr><td>p50 / p95 / p99</td><td>Percentiles across requests. Tail latency, not average</td>
+<td>The number an SLO is written against</td></tr>
+<tr><td>Throughput</td><td>Total output tokens per second across all requests</td><td>88.6 tok/s</td></tr>
+<tr><td>Goodput</td><td>Throughput counting <i>only</i> requests that met their SLO</td>
+<td>The metric that stops you gaming throughput with huge batches</td></tr>
+</table>
+
+<h3>12.5 Your sweep has two different ceilings, measured separately</h3>
+<p>This is the part of the repo that is genuinely uncommon. The same sweep was run twice with
+different KV pool sizes, and the throughput flattens for a different reason each time.</p>
+<div class="ex"><span class="lbl">Example 12-A: the compute ceiling (realistic pool, 0.9 utilisation)</span>
+<pre>pool: 14,836 blocks x 16 tokens = 237,376 tokens = 309 concurrent sequences
+nothing ever queues in this configuration.
+
+ batch   TPOT ms   tok/s     read
+     1     11.28      88.6   memory-bound, tensor cores idle
+    16     17.13     934     nearly free scaling
+    64     23.73    2697     <- knee: 30x throughput for 2.1x latency
+   128     44.30    2889     +7% throughput, +87% latency
+   256     86.29    2967     +10% throughput, +264% latency
+
+ceiling ~2700-2970 tok/s. cause: the batched GEMM saturates the tensor cores.
+this is the AI(B) = B crossing from Day 5.</pre>
+</div>
+<div class="ex"><span class="lbl">Example 12-B: the KV admission ceiling (constrained pool, 0.4 utilisation)</span>
+<pre>pool: 1,224 blocks x 16 tokens = 19,584 tokens = 25 concurrent sequences
+
+ batch   TPOT ms   tok/s   queued?
+    16     17.02     940    False    all 16 fit in the pool
+    32     33.13     966    TRUE     32 > 25, so 7+ sequences wait
+    48     43.82    1095    TRUE
+    64     67.38     950    TRUE     throughput has stopped rising entirely
+
+ceiling ~950-1095 tok/s, less than HALF the compute ceiling.
+cause: the pool holds 25 sequences. the flag in the CSV flips at exactly the
+       batch size that exceeds it.</pre>
+</div>
+<div class="key"><b>How to tell this in an interview.</b> "I measured two plateaus on the same GPU and
+the same model. With a full KV pool, throughput flattens at about 2700 tok/s because the tensor cores
+saturate, and the arithmetic-intensity model predicts that crossing. With the pool cut to 40% of
+memory, it flattens at about 1000 tok/s instead, and the engine's own queue flag turns on at exactly
+batch 32, which is the first batch larger than the pool's 25-sequence capacity. Same curve shape, two
+completely different causes, and you can only tell them apart by instrumenting admission rather than
+memory, because a paged engine's VRAM is flat either way."</div>
+
+<h3>12.6 TTFT is where batching costs you, and it is visible</h3>
+<div class="ex"><span class="lbl">Example 12-C: TTFT against batch size, realistic pool</span>
+<pre> batch    TTFT s      per-prompt prefill
+     1     0.112
+     2     0.218
+     8     0.727
+    16     1.405
+    32     2.774
+    48     4.145      37x the batch-1 TTFT
+
+TTFT is almost exactly linear in batch size, because prefill is compute-bound
+(Day 5) so the prompts cannot overlap. they serialise.</pre>
+</div>
+<p>That linear curve is the entire motivation for chunked prefill in one plot. The 48th user waits 4.1
+seconds for a first token because 47 other prompts are ahead of them, and no amount of KV cache fixes
+it, because the limit is the compute ceiling and not memory.</p>
+
+<h3>12.7 Exit bar for Days 9-12</h3>
+<ol class="tight">
+<li>Write the online-softmax recurrence from a blank page and work it on a four-element example that
+matches the direct computation.</li>
+<li>State what FlashAttention changes (HBM traffic) and what it does not (FLOPs), and give the
+quadratic traffic figure for a 4096-token prefill on this model.</li>
+<li>Give both reasons FlashAttention does nothing at batch-1 decode, then describe split-KV and its
+combine step.</li>
+<li>Quote attention as 5% of your decode step, and say what that implies about where to optimise.</li>
+<li>Describe iteration-level scheduling and why attention cannot be batched the way linear layers
+can.</li>
+<li>Name your two plateaus, their values, and the distinct mechanism behind each.</li>
+</ol>
+
+<h3>12.8 Self-test</h3>
+<p><b>Q1. Softmax needs the whole row for its denominator. How can attention be tiled?</b><br>
+Keep a running max <code>m</code>, a running sum <code>l</code>, and a running output <code>O</code>.
+When a new tile has a larger max, multiply <code>l</code> and <code>O</code> by
+<code>exp(m_old - m_new)</code> and continue. The result is exact, not approximate: on scores
+[1,3,2,5] with values [10,20,30,40] the two-tile recurrence and the direct computation both give
+36.8812.</p>
+<p><b>Q2. Does FlashAttention reduce the complexity of attention?</b><br>
+No. Compute stays <code>O(N&sup2;d)</code> and the backward pass recomputes scores rather than storing
+them, so it does more arithmetic. What drops from <code>O(N&sup2;)</code> to <code>O(N)</code> is HBM
+traffic. It is an IO-aware algorithm, and it wins because attention was memory-bound, not
+compute-bound.</p>
+<p><b>Q3. You added FlashAttention and batch-1 decode did not get faster. Why?</b><br>
+Because at query length 1 the score matrix is a 1-by-n row, about 1 KiB, so there is nothing to keep
+out of HBM, and FA's parallelisation over query blocks yields 12 blocks for 28 SMs. The real cost is
+reading the KV cache and the weights. In my trace, attention is 0.61 ms of a 12.56 ms step, under 5%.
+The fix for the parallelism half is flash-decoding, which splits the KV sequence across SMs and merges
+the partials with the same online-softmax rescale. My vLLM trace shows exactly that: 28 split-KV
+kernels and 28 combine kernels per step, one pair per layer.</p>
+<p><b>Q4. How would you pick a batch size for a production SLO?</b><br>
+Measure the throughput-latency Pareto and find the knee, then walk back to the largest batch that
+still meets the TPOT budget. On my sweep the knee is 64: 30x throughput for 2.1x latency up to that
+point, then 10% more throughput for 264% more latency out to 256. I would also check which ceiling I
+am hitting, because they need different fixes. My compute ceiling was 2700 tok/s and my KV admission
+ceiling, with a deliberately small pool, was 1000 tok/s, and only the second one is solved by buying
+memory.</p>
+
+<p class="links"><b>Sources:</b>
+<a href="https://www.usenix.org/conference/osdi22/presentation/yu">Yu et al., Orca (OSDI 22)</a> &middot;
+<a href="https://arxiv.org/abs/2308.16369">Agrawal et al., Sarathi (chunked prefill)</a> &middot;
+<a href="https://arxiv.org/abs/2403.02310">Sarathi-Serve</a> &middot;
+<a href="https://www.anyscale.com/blog/continuous-batching-llm-inference">Anyscale, Continuous batching</a> &middot;
+<a href="https://www.databricks.com/blog/llm-inference-performance-engineering-best-practices">Databricks, LLM Inference Performance Engineering</a></p>
+
+<hr>
+<p class="small">Repo sources for every measured number above:
+<code>results/trace_vllm-graph.json.gz</code>, <code>results/profile_summary.csv</code>,
+<code>results/vllm_batch_sweep.csv</code>, <code>docs/profiling.md</code>,
+<code>docs/batching-results.md</code>. Batch-sweep throughput is derived as
+<code>batch / TPOT</code>. Where a CSV and a prose doc disagree, the CSV is used.</p>
