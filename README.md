@@ -32,6 +32,24 @@ docs/                        per-task writeups (baseline, vLLM, OOM) and the com
 blog/draft.md                writeup, grown alongside the measurements
 ```
 
+### Documents
+
+The repo also carries the written side of the phase, which is half the artifact:
+
+| file | what it is |
+| --- | --- |
+| `blog/draft.md` | the writeup, grown alongside the measurements |
+| `docs/phase1.md` | full scope, methodology, and deliverables for the phase |
+| `docs/vastai.md` | the compute record for the rented box |
+| `docs/sglang-contribution-runbook.md` | step by step plan for the first SGLang PR |
+| `ROADMAP_3week_interview_prep.pdf` | the 3-week roadmap these notes follow |
+| `WEEK1_DAY1-4_condensed.pdf` | condensed lecture notes, days 1-4 |
+| `WEEK1_DAY5-8_condensed.pdf` | condensed lecture notes, days 5-8 |
+| `DAY9-12_condensed.pdf` | condensed lecture notes, days 9-12 |
+
+HTML sources for the PDFs live in `docs/lecture-src/` so they can be re-rendered
+rather than rewritten.
+
 ## Hardware
 
 Phase 1 runs on a rented Vast.ai box, not Colab. The full record is in
