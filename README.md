@@ -19,6 +19,11 @@ scripts/
   bench_vllm_batch.py        Week 3: vLLM batching throughput/latency sweep
   plot_batch_sweep.py        plots for the batching sweep
   analyze_vram_deviations.py per-step VRAM delta reader for the OOM CSV
+  profile_decode.py          Week 6: PyTorch profiler trace of the HF decode step
+  profile_vllm.py            Week 6: the same trace for vLLM (via the engine hook)
+  analyze_trace.py           Week 6: one parser reducing either trace to 3 numbers
+  measure_bandwidth.py       measured vs spec memory bandwidth for this exact card
+  sglang_cudagraph_cliff.py  SGLang issue #33483 repro (decode CUDA-graph cliff)
 results/                     raw CSV logs and plots
 docs/                        per-task writeups (baseline, vLLM, OOM) and the compute record
 blog/draft.md                writeup, grown alongside the measurements
