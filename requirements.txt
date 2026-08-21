@@ -5,9 +5,10 @@
 # the main friction point of the phase, so it gets installed separately and the
 # working combination is recorded in the README rather than pinned blindly here.
 #
-# On Colab, torch ships preinstalled and matched to the runtime's CUDA. Do not
-# force a torch version for the baseline; use what the T4 runtime provides. The
-# pins below are the things that are safe to fix.
+# Phase 1 no longer runs on Colab. On the Vast.ai box the NGC image ships torch
+# 2.12.0+cu130 preinstalled and matched to the driver, so torch is deliberately
+# absent from this file: pinning it here would fight the image. The pins below
+# are the things that are safe to fix on top of whatever torch the image gives.
 
 # --- Task 1: HuggingFace baseline ---
 # transformers 4.44.2 used the legacy per-layer rotary embedding that registers
