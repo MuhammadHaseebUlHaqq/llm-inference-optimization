@@ -66,7 +66,7 @@ Gotchas: count only generated tokens in the decode rate; synchronize before ever
 
 ## Task 2: vLLM serving the same model
 
-- [ ] Install vLLM. Expect this to eat real time. Pin a version compatible with Colab's CUDA and torch. The T4 is compute capability 7.5: vLLM runs on it, but some optimized attention backends target newer GPUs, so it may fall back to a default backend. Note whatever combination works in the README.
+- [ ] Install vLLM. Expect this to eat real time. On the 3060 the friction is not the attention backend (sm_86 gets the good kernels) but the torch pin: vLLM is binary-tied to its own torch build, so it goes into a separate venv rather than on top of the image's torch. Note whatever combination works in the README.
 - [ ] Use vLLM's offline `LLM` class (in-process), not the HTTP server, for a clean single-process benchmark. Set `dtype="float16"` and a sensible `gpu_memory_utilization`.
 - [ ] `bench_vllm.py`: same model, same prompt, same `max_new_tokens`, same batch size 1, measured with the same harness logic.
 - [ ] Produce a comparison table (HF vs vLLM): decode tokens/sec, prefill latency, peak VRAM.
