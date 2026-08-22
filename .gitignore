@@ -50,3 +50,7 @@ results/vllm_trace/
 *.sqlite
 *.json.tmp
 torch_profiler_out/
+
+# Local agent state. Session transcripts and scratch, not part of the artifact.
+.claude/
+!.claude/settings.json
