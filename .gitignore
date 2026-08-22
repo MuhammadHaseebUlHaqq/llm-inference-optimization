@@ -42,3 +42,11 @@ nohup.out
 
 # vLLM per-worker profiler dumps; the copied trace in results/ is the artifact
 results/vllm_trace/
+
+# Profiler scratch. Raw captures are large and regenerate from the scripts; only
+# the reduced trace_*.json.gz and profile_summary.csv in results/ are artifacts.
+*.nsys-rep
+*.qdrep
+*.sqlite
+*.json.tmp
+torch_profiler_out/
