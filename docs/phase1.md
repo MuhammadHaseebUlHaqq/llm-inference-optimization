@@ -57,7 +57,7 @@ These are the rules every script follows. Most wrong inference numbers come from
 
 ## Task 1: HuggingFace baseline (the control)
 
-- [ ] Load Qwen2.5-1.5B (or TinyLlama) in fp16 on the T4.
+- [ ] Load Qwen2.5-1.5B (or TinyLlama) in fp16 on the GPU.
 - [ ] Build `bench_common.py`: the timing + VRAM + logging harness described above, written once and reused.
 - [ ] `baseline_hf.py`: warmup, then a measured run that records prefill latency, decode tokens/sec, and peak VRAM, and writes a row to `results/`.
 - [ ] Confirm the numbers are stable and sane across a couple of runs. This is the control, so it has to be boringly solid before vLLM is touched.
@@ -93,7 +93,7 @@ Output: `results/oom_curve.png` plus a short paragraph in the blog draft explain
 ## Task 5: blog draft and repo polish
 
 - [ ] Blog draft has: the setup, the HF-vs-vLLM table, the OOM curve with the predicted-vs-measured comparison, and a paragraph on why the gap between the two engines exists (the thing later phases will build).
-- [ ] README explains the working dependency versions and how to reproduce on a fresh T4.
+- [ ] README explains the working dependency versions and how to reproduce on a fresh box.
 
 ## Definition of done for Phase 1
 
@@ -102,7 +102,7 @@ Output: `results/oom_curve.png` plus a short paragraph in the blog draft explain
 - vLLM run committed with the comparison table.
 - The OOM curve committed, with the analytical prediction overlaid and the crash point identified.
 - Blog draft holding the curve and the mechanism paragraph.
-- A fresh clone runs on a T4 by following the README.
+- A fresh clone runs on a single GPU by following the README.
 
 ## Order and the one trap
 
