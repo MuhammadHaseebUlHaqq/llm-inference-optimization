@@ -45,7 +45,7 @@ These are the rules every script follows. Most wrong inference numbers come from
 - Always `torch.cuda.synchronize()` immediately before reading any timer. GPU kernels launch asynchronously, so without a sync you measure launch time, not execution time.
 - Run a warmup generation before any timed run and discard it. The first call pays for CUDA init and kernel setup.
 - VRAM logging tracks both `torch.cuda.memory_allocated()` and `torch.cuda.memory_reserved()`, and reports the peak via `torch.cuda.max_memory_allocated()`. Reset peak stats before each measured run with `torch.cuda.reset_peak_memory_stats()`.
-- fp16 only (`dtype=torch.float16` / `dtype="float16"`). Never bf16 on the T4.
+- fp16 only (`dtype=torch.float16` / `dtype="float16"`). Never bf16. The 3060 is sm_86 and does support bf16, so this is not a hardware limit: it is comparability with the later NUST HPC V100/T4 runs, which do not. It does not change the KV-cache math either way, since fp16 and bf16 are both 2 bytes per element.
 - Inference mode: `model.eval()` and `torch.inference_mode()` for the HF path.
 - Fairness: identical model, identical prompt, identical `max_new_tokens`, greedy decoding (temperature 0), and batch size 1 across HF and vLLM. A comparison is only valid if the only thing that changed is the engine.
 
