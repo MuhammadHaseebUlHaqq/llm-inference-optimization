@@ -2,6 +2,14 @@
 
 Working plan for this phase. Hand this to Claude Code as the task breakdown. Persistent context and constraints live in `CLAUDE.md`; this file is the ordered set of things to build and the precise definitions to build them against.
 
+> Hardware note. This plan was written against a single Colab T4 and is kept in
+> that form because the task breakdown and the measurement definitions did not
+> change. The phase actually ran on a rented Vast.ai RTX 3060 12GB (Ampere,
+> sm_86). Where this file and `docs/vastai.md` disagree about hardware, the
+> Vast.ai record wins. The practical differences: sm_86 supports bf16 and the
+> good attention backends, so there is no fallback-backend worry, and 12GB puts
+> the KV-cache cliff slightly earlier than 16GB would.
+
 ## The goal in one paragraph
 
 Run a small model two ways on a single Colab T4: first with plain HuggingFace `transformers` (the slow, readable control), then through vLLM (the optimized engine). Measure both with the same harness. Then deliberately push the KV cache until it OOMs, plot VRAM against context length, and compare the measured crash point to the Phase 0 analytical prediction. The deliverable is a public, reproducible repo plus a blog draft, not just code that ran once.
