@@ -27,3 +27,25 @@ The exact commands are in the README, split by environment: `baseline_hf.py` and
 `vllm` in the name runs in Environment B (`/workspace/vllm-env`). Both write with
 `--csv`, appending a row per run rather than overwriting, so a re-run adds history
 instead of destroying it.
+
+## Reading the benchmark CSVs
+
+`baseline_hf.csv`, `baseline_vllm.csv`, and `oom_sweep.csv` share one schema,
+written by `bench_common.py`, so they can be concatenated. The columns that carry
+the claims:
+
+- `prefill_seconds` and `decode_seconds` are always separate. Prefill is the one
+  forward pass over the prompt; decode is the token-at-a-time loop. Never blend
+  them into a single latency number.
+- `decode_tokens_per_sec` is the headline number: new tokens divided by decode
+  wall time, excluding the prompt and excluding prefill.
+- `weights_vram_mib`, `peak_allocated_mib`, and `peak_reserved_mib` are tracked
+  separately on purpose. Allocated is what tensors hold; reserved is what the
+  caching allocator took from the driver. The gap between them is real and is not
+  a leak.
+- The vLLM rows report NVML device-used, not allocator numbers, because the v1
+  engine reserves its KV pool up front in a child process. That figure is not
+  comparable to the HF rows, which grow organically. The `note` column says so on
+  every affected row.
+- `oom` marks the row where the run actually died. In `oom_sweep.csv` the rows
+  before it are `checkpoint` rows from one continuous decode, not separate runs.
