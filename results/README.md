@@ -19,3 +19,11 @@ here, the CSV wins.
 | `trace_vllm-*.json.gz` | `profile_vllm.py` | the same window under vLLM, one file per engine mode |
 | `profile_summary.csv` | `analyze_trace.py` | traces reduced to kernels, launches, and idle gap per step |
 | `decode_timeline.png` | `analyze_trace.py` | the reduced traces drawn on a common time axis |
+
+## Reproducing
+
+The exact commands are in the README, split by environment: `baseline_hf.py` and
+`oom_sweep.py` run in Environment A (the image's torch 2.12), everything with
+`vllm` in the name runs in Environment B (`/workspace/vllm-env`). Both write with
+`--csv`, appending a row per run rather than overwriting, so a re-run adds history
+instead of destroying it.
