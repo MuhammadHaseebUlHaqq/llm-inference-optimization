@@ -23,3 +23,13 @@ only exists in this log:
   actually held through the engine rather than being silently upcast.
 - The resolved `max_model_len=784` and `gpu_memory_utilization=0.9`, which are
   what make the pool that size and are therefore part of the measurement.
+
+Note the version skew in this file: it was captured under vLLM 0.25.1, while the
+pinned Task 2 run in the README is 0.23.0. The numbers quoted above are stable
+across both, but do not read any 0.25-only field here as if it described the
+pinned environment.
+
+## Convention
+
+Logs are committed only when they carry something the CSVs cannot. Routine run
+output is not archived here. `nohup.out` is gitignored for that reason.
