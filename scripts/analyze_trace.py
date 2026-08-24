@@ -30,8 +30,8 @@ against the profiled span, and labels it as biased.
 Usage:
     python scripts/analyze_trace.py \
         --trace hf=results/trace_hf_decode.json.gz \
-        --trace vllm-eager=results/trace_vllm_eager.json.gz \
-        --trace vllm-graph=results/trace_vllm_graph.json.gz \
+        --trace vllm-eager=results/trace_vllm-eager.json.gz \
+        --trace vllm-graph=results/trace_vllm-graph.json.gz \
         --clean-step-ms hf=41.2 \
         --figure results/decode_timeline.png
 """
