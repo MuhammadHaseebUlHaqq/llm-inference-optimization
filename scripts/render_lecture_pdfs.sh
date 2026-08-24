@@ -7,7 +7,8 @@
 # skipped, so the PDFs drift from the sources. This does it in one command.
 #
 # Usage, from the repo root:
-#   bash scripts/render_lecture_pdfs.sh
+#   bash scripts/render_lecture_pdfs.sh            # render all three
+#   bash scripts/render_lecture_pdfs.sh day9-12    # render one, by source stem
 #
 # Page geometry (A4, margins, font sizes) lives in the @page and body rules at
 # the top of each source file, not here. Day sections carry class="day", which
@@ -60,9 +61,13 @@ to_file_url() {
 chrome="$(find_chrome)"
 echo "chrome: $chrome"
 
+only="${1:-}"
+rendered=0
+
 for entry in "${targets[@]}"; do
   stem="${entry%%:*}"
   out="${entry#*:}"
+  if [ -n "$only" ] && [[ "$stem" != *"$only"* ]]; then continue; fi
 
   src="$src_dir/$stem.html"
   if [ ! -f "$src" ]; then
@@ -74,4 +79,14 @@ for entry in "${targets[@]}"; do
   # --no-pdf-header-footer drops the default URL/date furniture, which otherwise
   # prints on every page and makes the output look like a webpage dump.
   "$chrome" --headless --disable-gpu --no-pdf-header-footer --no-sandbox --print-to-pdf="$repo_root/$out" "$(to_file_url "$src")"
+  rendered=$((rendered + 1))
 done
+
+if [ "$rendered" -eq 0 ]; then
+  echo "no source matched '$only'" >&2
+  exit 1
+fi
+
+echo "rendered $rendered file(s). Check the page count before committing: headless"
+echo "Chrome silently repaginates when a source changes, and the counts recorded"
+echo "in docs/lecture-src/README.md are part of the record."
