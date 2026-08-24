@@ -37,6 +37,17 @@ find_chrome() {
   exit 1
 }
 
+to_file_url() {
+  # Chrome wants an absolute file:// URL. On Git Bash the path is /c/... but
+  # Chrome is a native Windows binary, so hand it a Windows path instead.
+  local p="$1"
+  if command -v cygpath >/dev/null 2>&1; then
+    echo "file:///$(cygpath -m "$p")"
+  else
+    echo "file://$p"
+  fi
+}
+
 chrome="$(find_chrome)"
 echo "chrome: $chrome"
 
@@ -53,5 +64,5 @@ for entry in "${targets[@]}"; do
   echo "rendering $stem.html -> $out"
   # --no-pdf-header-footer drops the default URL/date furniture, which otherwise
   # prints on every page and makes the output look like a webpage dump.
-  "$chrome" --headless --disable-gpu --no-pdf-header-footer --no-sandbox --print-to-pdf="$repo_root/$out" "file://$src"
+  "$chrome" --headless --disable-gpu --no-pdf-header-footer --no-sandbox --print-to-pdf="$repo_root/$out" "$(to_file_url "$src")"
 done
