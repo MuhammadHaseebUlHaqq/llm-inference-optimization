@@ -90,7 +90,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--copy-to",
         default="",
-        help="Copy the produced trace here, e.g. results/trace_vllm_graph.json.gz. "
+        help="Copy the produced trace here, e.g. results/trace_vllm-graph.json.gz. "
         "Defaults to results/trace_<label>.json.gz.",
     )
     parser.add_argument("--gpu-mem-util", type=float, default=0.9)
