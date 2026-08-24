@@ -27,11 +27,20 @@ targets=(
 )
 
 find_chrome() {
-  # Explicit override wins, then PATH.
+  # Explicit override wins, then PATH, then the usual install locations. Any
+  # Chromium-family binary works; the flags below are Chrome's.
   if [ -n "${CHROME:-}" ]; then echo "$CHROME"; return; fi
   local c
-  for c in google-chrome chrome chromium chromium-browser; do
+  for c in google-chrome chrome chromium chromium-browser msedge; do
     if command -v "$c" >/dev/null 2>&1; then command -v "$c"; return; fi
+  done
+  for c in \
+    "/c/Program Files/Google/Chrome/Application/chrome.exe" \
+    "/c/Program Files (x86)/Google/Chrome/Application/chrome.exe" \
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+    "/usr/bin/chromium"
+  do
+    if [ -x "$c" ]; then echo "$c"; return; fi
   done
   echo "no Chrome or Chromium binary found; set CHROME=/path/to/chrome" >&2
   exit 1
