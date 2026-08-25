@@ -1,0 +1,7 @@
+# The repo is edited on Windows but runs on the Linux box (and, later, on the
+# NUST HPC nodes). core.autocrlf=true here rewrites checkouts to CRLF, and a
+# shell script with CRLF line endings fails on Linux with a "bad interpreter"
+# error on the shebang, because the \r is part of the interpreter path. Pin the
+# things that get executed to LF regardless of platform.
+*.sh text eol=lf
+*.py text eol=lf
