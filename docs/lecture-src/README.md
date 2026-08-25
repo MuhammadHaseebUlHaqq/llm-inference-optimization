@@ -16,13 +16,26 @@ Day 8 onward is Week 2. That is why the Days 9-12 PDF has no week prefix.
 Measured numbers in these documents come from `results/*.csv`. Where a CSV and a
 prose doc in `docs/` disagree, the CSV wins.
 
-Render with headless Chrome, from the repo root:
+Render with `scripts/render_lecture_pdfs.sh`, from the repo root:
 
 ```
-chrome.exe --headless --disable-gpu --no-pdf-header-footer \
+bash scripts/render_lecture_pdfs.sh              # all three
+bash scripts/render_lecture_pdfs.sh day9-12      # one, matched on the source stem
+```
+
+The script finds a Chrome or Chromium binary, converts the source path to the
+absolute `file://` URL Chrome requires, and writes each PDF to the repo root
+under the name in the table above. Set `CHROME=/path/to/chrome` to override the
+lookup. It is a thin wrapper over the invocation that used to be typed by hand:
+
+```
+chrome --headless --disable-gpu --no-pdf-header-footer \
   --print-to-pdf="WEEK1_DAY1-4_condensed.pdf" \
   "file:///<abs-path>/docs/lecture-src/week1_day1-4_condensed.html"
 ```
+
+Check the page counts in the table after rendering. Chrome repaginates silently
+when a source changes, and those counts are part of the record.
 
 Page geometry (A4, margins, font sizes) lives in the `@page` and `body` rules at
 the top of each source file. Day sections carry `class="day"`, which forces a page
