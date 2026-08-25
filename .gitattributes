@@ -5,3 +5,15 @@
 # things that get executed to LF regardless of platform.
 *.sh text eol=lf
 *.py text eol=lf
+
+# Text that is only ever read, not executed. Normalized so diffs stay clean.
+*.md text
+*.txt text
+*.csv text
+*.html text
+*.ipynb text
+
+# Binary. Never touch, never try to diff.
+*.pdf binary
+*.png binary
+*.gz binary
