@@ -14,7 +14,8 @@ per-week numbering in `ROADMAP_3week_interview_prep.pdf`. Days 1-7 are Week 1,
 Day 8 onward is Week 2. That is why the Days 9-12 PDF has no week prefix.
 
 Measured numbers in these documents come from `results/*.csv`. Where a CSV and a
-prose doc in `docs/` disagree, the CSV wins.
+prose doc in `docs/` disagree, the CSV wins. Which script wrote which CSV is in
+`results/README.md`.
 
 Render with `scripts/render_lecture_pdfs.sh`, from the repo root:
 
