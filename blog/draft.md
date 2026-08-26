@@ -362,3 +362,12 @@ the HF baseline and the OOM sweep run against the image's torch, vLLM runs in it
 own venv because it is binary-tied to a different torch build, and the profiling
 scripts write traces that `analyze_trace.py` reduces through one parser for both
 engines, so "idle gap" means the same thing on each side.
+
+Two caveats on the hardware, both of which matter more than they sound. The
+bandwidth figures divide by a peak, and which peak is not obvious: 360 GB/s is
+this card's theoretical, 291.5 GB/s is what a large streaming read actually
+reaches, and a percentage is meaningless without saying which one it is against.
+`scripts/measure_bandwidth.py` reports both for whatever card it is run on. And
+two nominally identical 3060s are not identical: the same decode work came out
+1.22x slower on one box than another, which is the kind of thing that looks like
+a regression until you measure the card instead of trusting the model name.
