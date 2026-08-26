@@ -348,3 +348,17 @@ ceiling where every sequence still runs; the other is a KV-admission ceiling whe
 the surplus queues. The first is about how fast the kernels go, the second about how
 many sequences fit, and telling them apart is the whole reason for running the pool
 constrained as well as full.
+
+## Reproducing this
+
+Every number above comes from a CSV in `results/`, and every CSV comes from a
+script in `scripts/`. The mapping is in `results/README.md`, along with the
+column definitions and the two places the numbers are easy to misread: vLLM VRAM
+is NVML device-used and is not comparable to the HF allocator figures, and the
+OOM rows are checkpoints of one continuous decode rather than independent runs.
+
+The commands are in the repo README, split by environment. The short version:
+the HF baseline and the OOM sweep run against the image's torch, vLLM runs in its
+own venv because it is binary-tied to a different torch build, and the profiling
+scripts write traces that `analyze_trace.py` reduces through one parser for both
+engines, so "idle gap" means the same thing on each side.
