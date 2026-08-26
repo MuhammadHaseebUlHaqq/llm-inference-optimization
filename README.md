@@ -27,8 +27,9 @@ scripts/
   render_lecture_pdfs.sh     re-renders the lecture PDFs from docs/lecture-src/
 test/
   probe_weights_vram.py      breaks resident weights down by dtype, pins VRAM gaps
-results/                     raw CSV logs, plots, and profiler traces
+results/                     raw CSV logs, plots, and profiler traces (see results/README.md)
 logs/                        raw engine stdout kept for claims the CSVs do not carry
+colab/run.ipynb              superseded, kept as the record of the original T4 runner
 docs/                        per-task writeups (baseline, vLLM, OOM) and the compute record
 blog/draft.md                writeup, grown alongside the measurements
 ```
