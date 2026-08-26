@@ -24,6 +24,7 @@ scripts/
   analyze_trace.py           Week 6: one parser reducing either trace to 3 numbers
   measure_bandwidth.py       measured vs spec memory bandwidth for this exact card
   sglang_cudagraph_cliff.py  SGLang issue #33483 repro (decode CUDA-graph cliff)
+  render_lecture_pdfs.sh     re-renders the lecture PDFs from docs/lecture-src/
 test/
   probe_weights_vram.py      breaks resident weights down by dtype, pins VRAM gaps
 results/                     raw CSV logs, plots, and profiler traces
