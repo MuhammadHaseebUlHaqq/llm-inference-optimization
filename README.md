@@ -175,6 +175,20 @@ On this card that is 360 GB/s theoretical against 291.5 GB/s achievable. It
 matters: two nominally identical 3060s ran the same decode work 1.22x apart, so a
 before/after comparison split across boxes is meaningless. See `docs/profiling.md`.
 
+### SGLang CUDA-graph cliff repro
+
+Not part of Phase 1's measurement, but it runs from this repo. Reproduces SGLang
+issue #33483 (decode falls back to eager above the default `max_bs`, so TPOT
+jumps) on a different card than the one it was filed against, which is the part
+nobody had contributed. Runs inside an SGLang environment, not A or B:
+
+```bash
+python scripts/sglang_cudagraph_cliff.py --phase sweep
+python scripts/sglang_cudagraph_cliff.py --phase bimodality
+```
+
+The plan for turning this into a PR is `docs/sglang-contribution-runbook.md`.
+
 ## Constraints
 
 - fp16 only, never bf16. The 3060 supports bf16, but we target fp16 for
