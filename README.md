@@ -143,6 +143,27 @@ Throughput is total output tokens across the batch divided by wall time, never
 blended with the batch-1 decode rate. `ignore_eos` forces exactly the requested
 output length per sequence, so total output equals batch x output length.
 
+### Profiling (Week 6)
+
+Explains the gap rather than restating it: capture a trace of one decode window
+per engine, then reduce both through the same parser so "idle gap" means the
+identical thing on each side.
+
+```bash
+# Environment A
+python scripts/profile_decode.py --model Qwen/Qwen2.5-1.5B --prompt-tokens 512 \
+    --trace results/trace_hf_decode.json.gz
+# Environment B, once per engine mode
+python scripts/profile_vllm.py --label vllm-eager     --enforce-eager
+python scripts/profile_vllm.py --label vllm-compile   --no-cudagraph
+python scripts/profile_vllm.py --label vllm-graphonly --cudagraph-only
+python scripts/profile_vllm.py --label vllm-graph
+# reduce every trace through one parser
+python scripts/analyze_trace.py --trace hf=results/trace_hf_decode.json.gz \
+    --trace vllm-graph=results/trace_vllm-graph.json.gz \
+    --clean-step-ms hf=41.2 --figure results/decode_timeline.png
+```
+
 ## Constraints
 
 - fp16 only, never bf16. The 3060 supports bf16, but we target fp16 for
