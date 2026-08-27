@@ -164,6 +164,17 @@ python scripts/analyze_trace.py --trace hf=results/trace_hf_decode.json.gz \
     --clean-step-ms hf=41.2 --figure results/decode_timeline.png
 ```
 
+Every "% of peak bandwidth" claim divides by a peak, and which peak is not
+obvious. Measure the card rather than trusting the model name:
+
+```bash
+python scripts/measure_bandwidth.py
+```
+
+On this card that is 360 GB/s theoretical against 291.5 GB/s achievable. It
+matters: two nominally identical 3060s ran the same decode work 1.22x apart, so a
+before/after comparison split across boxes is meaningless. See `docs/profiling.md`.
+
 ## Constraints
 
 - fp16 only, never bf16. The 3060 supports bf16, but we target fp16 for
