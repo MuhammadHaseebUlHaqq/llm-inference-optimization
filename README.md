@@ -208,7 +208,14 @@ actually ran on the 3060:
 - Environment A (baseline + OOM): torch 2.12.0+cu130 (preinstalled),
   transformers 4.46.3, accelerate 0.34.2. Pins in `requirements.txt`.
 - Environment B (vLLM): vLLM 0.23.0 (v1 engine) with torch 2.11.0+cu130, in the
-  separate `/workspace/vllm-env`.
+  separate `/workspace/vllm-env`. Tasks 2 and the Week 3 batching sweep.
+- Environment B, later rebuild (Week 6 profiling): vLLM 0.25.1 with torch
+  2.12.0+cu130. The profiler hook moved between these versions, which is why
+  `profile_vllm.py` reaches it through the engine API rather than the old
+  `VLLM_TORCH_PROFILER_DIR` variable (0.25 logs that variable as unknown).
+  Trace timings therefore come from 0.25.1, not from the pinned 0.23.0 runs.
+  Recorded rather than reconciled: re-running Task 2 under 0.25.1 would
+  invalidate the comparison the phase is built on.
 
 The transformers pin matters: 4.46+ moved rotary embeddings to a single
 model-level module, dropping a fixed ~1.79 GB of duplicated cos/sin buffers that
