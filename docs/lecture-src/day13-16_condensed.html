@@ -1,0 +1,588 @@
+<meta charset="utf-8">
+<title>Days 13-16: Serving Under an SLO, Week 2 Consolidation, Quantization</title>
+<style>
+@page { size: A4; margin: 14mm 15mm 14mm 15mm; }
+* { box-sizing: border-box; }
+body { font-family: "Charter", "Georgia", serif; font-size: 10.2pt; line-height: 1.38; color: #16181d; }
+h1 { font-size: 19pt; margin: 0 0 2px 0; line-height: 1.15; }
+h2 { font-size: 13pt; margin: 16px 0 6px 0; padding: 4px 0 4px 8px;
+     border-left: 4px solid #2b5fa8; background: #eef2f8; page-break-after: avoid; }
+h3 { font-size: 11pt; margin: 11px 0 4px 0; color: #1c3f70; page-break-after: avoid; }
+p { margin: 5px 0; }
+ul, ol { margin: 5px 0 5px 0; padding-left: 19px; }
+li { margin: 2px 0; }
+code, pre { font-family: "Consolas", "DejaVu Sans Mono", monospace; }
+code { font-size: 9pt; background: #f2f3f5; padding: 0 2px; border-radius: 2px; }
+pre { font-size: 8.6pt; background: #f7f8fa; border: 1px solid #dde1e8; border-radius: 3px;
+      padding: 6px 8px; margin: 6px 0; line-height: 1.32; white-space: pre-wrap;
+      overflow-x: auto; page-break-inside: avoid; }
+table { border-collapse: collapse; width: 100%; margin: 6px 0; font-size: 9.2pt;
+        page-break-inside: avoid; }
+th, td { border: 1px solid #ccd2dc; padding: 3px 6px; text-align: left; vertical-align: top; }
+th { background: #eef2f8; font-weight: 600; }
+.sub { color: #55606f; font-size: 10pt; margin: 0 0 10px 0; }
+.ex { border: 1px solid #b9cbe4; background: #f4f8fd; border-radius: 3px;
+      padding: 6px 9px; margin: 7px 0; page-break-inside: avoid; }
+.ex .lbl { font-family: Consolas, monospace; font-size: 8.4pt; font-weight: 700;
+           letter-spacing: .04em; color: #2b5fa8; text-transform: uppercase; display: block;
+           margin-bottom: 3px; }
+.key { border-left: 3px solid #c58b00; background: #fdf7e8; padding: 5px 9px; margin: 7px 0;
+       page-break-inside: avoid; }
+.key b { color: #8a6100; }
+a { color: #2b5fa8; text-decoration: none; }
+.links { font-size: 8.9pt; color: #55606f; margin: 5px 0 0 0; }
+.day { page-break-before: always; }
+.tight li { margin: 1px 0; }
+hr { border: 0; border-top: 1px solid #dde1e8; margin: 14px 0 0 0; }
+.small { font-size: 9pt; color: #55606f; }
+</style>
+
+<h1>Days 13-16</h1>
+<p class="sub">Serving under an SLO, the Week 2 consolidation day, and quantization in two parts.
+Continues the Days 1-4, 5-8 and 9-12 notes. Same model and card throughout: Qwen2.5-1.5B, fp16,
+one RTX 3060 12GB, with an RTX 3090 used once as a control.</p>
+
+<table>
+<tr><th>Day</th><th>Topic</th><th>The one thing you must be able to derive</th></tr>
+<tr><td>13</td><td>Serving under an SLO</td><td>Why the knee moved with neither card, and what that proves</td></tr>
+<tr><td>14</td><td>Week 2 consolidation</td><td>All four anchor answers, cold, timed, out loud</td></tr>
+<tr><td>15</td><td>Quantization: the argument</td><td>Why weight-only quantization is a bandwidth play, in bytes</td></tr>
+<tr><td>16</td><td>Quantization: the methods</td><td>Why your own 4-bit run got 2.27x slower, mechanically</td></tr>
+</table>
+
+<div class="key"><b>Where these four days sit.</b> Days 13 and 14 close Week 2 by turning the batching
+sweep into serving vocabulary and then rehearsing everything measured so far. Days 15 and 16 open
+Week 3 on the strongest differentiator available: a quantization result that went the <i>wrong</i>
+way and that can be explained exactly. A result that contradicts the naive story, understood, is
+worth more in an interview than three results that confirm it.</div>
+
+<!-- ===================== DAY 13 ===================== -->
+<h2>Day 13 &nbsp;&middot;&nbsp; Serving under an SLO: the Pareto, goodput, and preemption</h2>
+
+<p>Day 12 established the two ceilings. Day 13 is the question an interviewer actually asks: given
+those curves, <b>what batch size do you ship?</b> The answer is never "the one with the highest
+throughput", and being able to say why is the whole day.</p>
+
+<h3>13.1 Throughput and latency are one curve, not two</h3>
+<p>Every row of the sweep is a point on a Pareto frontier: decode throughput cannot be improved
+without paying per-token latency. Plotting one against the other collapses the whole table into the
+shape that matters.</p>
+
+<div class="ex"><span class="lbl">Example 13-A: the Pareto frontier, RTX 3060, realistic pool</span>
+<pre> batch   TPOT ms   decode tok/s   tok/s per ms of TPOT
+     1     11.28          88.6      7.9
+    16     17.18         931.3     54.2
+    32     21.35        1498.6     70.2
+    48     23.25        2064.4     88.8
+    64     23.73        2696.5    113.6   &lt;- best ratio anywhere on the curve
+    96     36.81        2608.0     70.9   &lt;- throughput went DOWN, latency up 55%
+   128     44.46        2879.0     64.8
+   192     72.26        2657.1     36.8
+   256     86.29        2966.7     34.4
+
+the last column is throughput bought per unit of latency spent. it rises to
+batch 64 and falls monotonically after. that is the knee stated as a ratio,
+rather than eyeballed off a plot.</pre>
+</div>
+
+<p>Note batch 96: throughput actually <i>fell</i> against batch 64 while TPOT rose 55%. That point is
+strictly dominated, meaning there is no SLO for which it is the right choice. A frontier with
+dominated points on it is normal and worth pointing out, because it shows the measurement had enough
+resolution to see non-monotonicity rather than smoothing it away.</p>
+
+<h3>13.2 Choosing a batch size, in the order you would actually do it</h3>
+<ol class="tight">
+<li>Write the SLO first, as a TPOT budget and a TTFT budget. "p95 TPOT under 25 ms" is an SLO;
+"as fast as possible" is not.</li>
+<li>Find the largest batch that still meets the TPOT budget. At 25 ms on this card that is batch 64,
+at 23.73 ms, with 1.27 ms of margin.</li>
+<li>Check the TTFT budget separately, because it is the constraint that usually binds first.</li>
+<li>Check <i>which</i> ceiling is being hit, because the fix differs: more memory for an admission
+ceiling, a bigger or better-utilised card for a compute ceiling.</li>
+</ol>
+
+<div class="key"><b>The TTFT trap.</b> Step 2 alone gives batch 64. But TTFT at batch 64 is
+<b>5.516 s</b>, against 0.112 s at batch 1: a 49x regression. If the SLO says "first token in under
+2 seconds", the entire TPOT analysis is irrelevant and the answer is batch 16 (TTFT 1.404 s, decode
+931 tok/s), which is <b>2.9x less throughput</b> than the knee. Two SLOs, one curve, batch sizes a
+factor of four apart. This is the answer that separates someone who has run a sweep from someone who
+has read about one.</div>
+
+<h3>13.3 Goodput is the metric that stops you gaming throughput</h3>
+<p>Throughput counts every token emitted. Goodput counts only tokens belonging to requests that met
+their SLO. The distinction exists because throughput is trivially maximised by a policy that ruins
+latency for everyone, and the number still goes up.</p>
+
+<div class="ex"><span class="lbl">Example 13-B: throughput up 10%, goodput to zero</span>
+<pre>SLO: TPOT &lt;= 25 ms.
+
+batch  64:  TPOT 23.73 ms   decode 2696.5 tok/s   -&gt; meets SLO
+            goodput = 2696.5 tok/s   (every token counts)
+
+batch 256:  TPOT 86.29 ms   decode 2966.7 tok/s   -&gt; violates SLO by 3.5x
+            throughput = 2966.7 tok/s   (+10%, and the dashboard is greener)
+            goodput    = 0 tok/s        (not one request met its budget)
+
+the operator who optimises the first number ships batch 256, and every user
+sees a 3.5x slower stream. the goodput column is what makes that visible.</pre>
+</div>
+
+<h3>13.4 Preemption: what a paged engine does when the pool runs out</h3>
+<p>The constrained-pool run from Day 12 was a scheduler experiment as much as a memory one. With a
+pool holding 25 concurrent sequences, batch 32 does not fail and does not thrash. It queues.</p>
+<pre>constrained pool: 1224 blocks x 16 tokens = 19,584 tokens = 25 sequences
+
+ batch   TPOT ms   decode tok/s   queued
+    16     17.07          937.3   False
+    32     33.18          964.5   TRUE     &lt;- flips at the first batch above 25
+    48     43.92         1093.0   TRUE
+    64     67.38          949.8   TRUE</pre>
+<p>Two mechanisms are available to a paged engine when admission fails, and they are worth naming
+separately:</p>
+<ul class="tight">
+<li><b>Swapping.</b> Copy a victim sequence's KV blocks out to host memory, and bring them back when
+it is rescheduled. Costs PCIe bandwidth twice, and preserves the computed KV.</li>
+<li><b>Recomputation.</b> Drop the victim's blocks entirely and re-run its prefill on resume. Costs
+compute, needs no transfer. Cheaper than swapping whenever prefill is fast relative to the link,
+which on this card it is: prefill runs at <b>4205 tok/s</b>.</li>
+</ul>
+<p>Both are why the constrained curve degrades gracefully to about 1000 tok/s rather than collapsing.
+Contrast the HuggingFace baseline, which under the same memory pressure does not queue, does not
+swap, and does not recompute: it raises <code>OutOfMemoryError</code> and the process dies. That is
+the same contrast as the OOM experiment, seen from the scheduler's side instead of the allocator's.</p>
+
+<h3>13.5 The cross-GPU control: is the knee a property of the model or of the card?</h3>
+<p>This is the most defensible part of the batching work, because it was a stated prediction that was
+then tested on different hardware.</p>
+<p>The prediction: the knee is where the per-sequence marginal cost catches the shared weight read.
+The weight read is a property of the <i>model</i>, so the knee should sit at roughly the same batch
+size on a different card, even though every absolute number moves.</p>
+
+<div class="ex"><span class="lbl">Example 13-C: the same sweep on an RTX 3090 (2.6x bandwidth, 1.4x compute)</span>
+<pre> batch   3060 TPOT   3090 TPOT   3060 tok/s   3090 tok/s   ratio
+     1      11.28        4.77         88.6        209.7     2.37x
+    16      17.18        6.13        931.3       2608.8     2.80x
+    32      21.35        6.60       1498.6       4845.3     3.23x
+    64      23.73        7.87       2696.5       8127.5     3.01x   &lt;- knee, both
+    96      36.81       11.19       2608.0       8582.6     3.29x
+   128      44.46       13.16       2879.0       9728.3     3.38x
+   256      86.29       25.32       2966.7      10112.1     3.41x
+
+TPOT is flat through batch 64 on BOTH cards and breaks at 96 on BOTH cards.
+every throughput number scales by 2.4x to 3.4x. the knee does not move.</pre>
+</div>
+
+<div class="key"><b>What the control proved, and what it refuted.</b> Confirmed: the knee location is
+a model property. It stayed at 64 on a card with 2.6x the bandwidth. Refuted: the plateau prediction.
+I predicted 6000-7000 tok/s on the 3090 from the bandwidth ratio alone and measured <b>10,112</b>.
+Bandwidth was the wrong single axis, because the plateau is set by a skinny GEMM whose ceiling the
+3090's extra compute also lifts. Say both halves. A prediction that half-failed and was diagnosed is
+a stronger signal than one that succeeded.</div>
+
+<h3>13.6 Why the plateau is not either roofline</h3>
+<p>The natural assumption is that a plateau means a hardware ceiling. Check it in numbers, on the
+3060 at batch 256:</p>
+<pre>compute:    ~9 TFLOPS achieved   of ~51 TFLOPS peak    = 16%
+bandwidth:  ~90 GB/s achieved    of 360 GB/s peak      = 25%
+
+neither is saturated, and throughput still will not rise.</pre>
+<p>The reason is operation shape. Batched decode is a GEMM with <code>M = batch</code>, which stays
+skinny even at 256 against a <code>K</code> and <code>N</code> in the thousands. A skinny GEMM is
+occupancy-bound rather than FLOP-bound, and tops out well under tensor-core peak. Meanwhile the paged
+KV reads are scattered across blocks, so they do not reach streaming bandwidth either. The plateau is
+the ceiling of <i>those specific kernels</i>, not of the GPU.</p>
+<p>The naive roofline agrees on the shape and fails on the number: it predicts an ideal batch of
+<code>142</code> at fp32-accumulate peak, or 280 at fp16-accumulate peak, against a measured 64. That
+2x-to-4x gap is itself a finding, and it is the honest form of the roofline claim. The roofline tells
+you which regime you are in, not what number you will hit.</p>
+
+<h3>13.7 Self-test, Day 13</h3>
+<p><b>Q1. Your sweep says batch 256 is fastest. Do you ship it?</b><br>
+No. It is 10% more decode throughput than batch 64 for 3.6x the per-token latency, and against a
+25 ms TPOT SLO its goodput is zero while batch 64's is 2696 tok/s. I would ship 64, and if TTFT is
+also budgeted I would ship lower still: TTFT at 64 is 5.5 s against 0.11 s at batch 1.</p>
+<p><b>Q2. How do you know your knee is not an artifact of that one GPU?</b><br>
+I reran the sweep on an RTX 3090 with 2.6x the bandwidth and 1.4x the compute. TPOT stayed flat
+through batch 64 and broke at 96 on both cards, so the knee did not move, which is what the
+<code>T_fixed + c1 x batch</code> model predicts, because the fixed term is the model's weight read.
+The plateau height did move, 2967 to 10,112 tok/s, and my bandwidth-only prediction of 6-7k was wrong
+for a reason I can name: the second card also lifts the skinny-GEMM ceiling.</p>
+<p><b>Q3. Your throughput flattened. Which resource ran out?</b><br>
+On this card, none of them. At batch 256 I was at 16% of compute peak and 25% of bandwidth peak. The
+limit is kernel shape: decode is a skinny GEMM that is occupancy-bound, plus scattered paged KV
+reads. That is also why the knee is at 64 and not at the roofline's predicted 142.</p>
+
+<p class="links"><b>Sources:</b>
+<a href="https://arxiv.org/abs/2309.06180">Kwon et al., PagedAttention / vLLM (preemption by swap or recompute)</a> &middot;
+<a href="https://www.usenix.org/conference/osdi22/presentation/yu">Yu et al., Orca (OSDI 22)</a> &middot;
+<a href="https://arxiv.org/abs/2401.09670">Zhong et al., DistServe (goodput as the objective)</a> &middot;
+<a href="https://www.databricks.com/blog/llm-inference-performance-engineering-best-practices">Databricks, LLM Inference Performance Engineering</a></p>
+
+<!-- ===================== DAY 14 ===================== -->
+<h2 class="day">Day 14 &nbsp;&middot;&nbsp; Week 2 consolidation: everything measured, said cold</h2>
+
+<p>This day reads nothing new. Week 2 covered the two topics an interviewer is most likely to go deep
+on, and the failure mode now is recognition without recall: every one of these ideas feels obvious on
+the page and disappears under an interruption. The work today is to produce all of it from a blank
+sheet, timed, out loud.</p>
+
+<h3>14.1 The blank-page drill, in order</h3>
+<p>Do these in one sitting, writing only, no notes open. Thirty to forty minutes total.</p>
+<table>
+<tr><th>#</th><th>Produce from memory</th><th>Correct answer, to check against after</th></tr>
+<tr><td>1</td><td>The KV-cache size formula and its value for this model</td>
+<td><code>2 x 28 x 2 x 128 x 2 = 28,672 B = 28 KiB/token</code></td></tr>
+<tr><td>2</td><td>The three wastes PagedAttention names</td>
+<td>reservation, internal fragmentation, external fragmentation</td></tr>
+<tr><td>3</td><td>The online-softmax recurrence, all three accumulators</td>
+<td><code>m</code>, <code>l</code>, <code>O</code>, with <code>c = exp(m_old - m_new)</code></td></tr>
+<tr><td>4</td><td>Why FlashAttention does nothing at batch-1 decode</td>
+<td>score matrix is 1 x n, no quadratic term and no tile worth keeping in SRAM</td></tr>
+<tr><td>5</td><td>What does help instead, and its combine step</td>
+<td>flash-decoding / split-KV, merged with the same rescale rule</td></tr>
+<tr><td>6</td><td>The step-time model and both of its limits</td>
+<td><code>T_fixed + c1 x batch</code>; linear then asymptotic to <code>1/c1</code></td></tr>
+<tr><td>7</td><td>The two plateaus and the distinct cause of each</td>
+<td>~2700 tok/s compute ceiling; ~1000 tok/s KV-admission ceiling</td></tr>
+<tr><td>8</td><td>The idle-versus-kernels split of the vLLM win</td>
+<td>25.34 ms idle removed (90%), 2.60 ms faster kernels (9%)</td></tr>
+</table>
+
+<h3>14.2 The number sheet, which should be reproducible without the CSVs</h3>
+<pre>MODEL      Qwen2.5-1.5B, fp16.  1,543,714,304 params.  28 layers,
+           12 query heads, 2 KV heads, head_dim 128, hidden 1536.
+           weights resident 2945 MiB, 3.09 GB streamed per decode step.
+
+CARD       RTX 3060 12GB, Ampere sm_86, 28 SMs.
+           ~51 TFLOPS fp16 (fp32-accumulate), 360 GB/s spec bandwidth,
+           291.5 GB/s measured achievable read bandwidth.
+           ridge point 51e12 / 360e9 = 142 FLOP/byte.
+
+PHASES     prefill  4205 tok/s   (122 ms for 512 tokens)
+           decode     28.1 tok/s (HF)   ->  150x per-token gap
+
+ENGINES    HF 28.1 -> vLLM 79.9 tok/s at batch 1  = 3.2x
+           of the 28.09 ms/token gap: 25.34 ms idle (90%), 2.60 ms kernels (9%)
+           HF step: 1198 kernels, 1198 CPU launches, 62.3% device idle
+           vLLM eager: 356 kernels (3.4x fewer)  <- fusion
+           graphs on: same 356 kernels, 17 launches, idle ~0  <- CUDA graphs
+           vLLM decode runs at 85% of the 291.5 GB/s achievable bandwidth
+
+MEMORY     OOM at 123,565 tokens of context
+           analytical 28 KiB/token, measured slope 62 KiB/token (2.21x)
+           at OOM: 10,437 MiB allocated, 11,764 MiB reserved, 1.3 GiB stranded
+           decode decayed 30.03 -> 2.93 tok/s across that sweep (10.3x)
+
+BATCHING   88.6 -> 2696 tok/s from batch 1 to 64 (30x), then 2967 at 256
+           TPOT 11.28 -> 23.73 -> 86.29 ms across the same range
+           T_fixed ~ 11 ms, c1 ~ 0.20 ms/seq, 1/c1 ~ 3000 tok/s
+           3090 control: knee still 64, plateau 10,112 tok/s</pre>
+
+<h3>14.3 The four anchor answers, timed</h3>
+<p>Say each out loud against a timer. The target is 60 to 90 seconds. Over 90 means it is being
+recited from a memorised paragraph rather than reconstructed, and it will not survive an
+interruption. Under 45 usually means a mechanism has been dropped.</p>
+<ol class="tight">
+<li><b>FlashAttention.</b> Tiling, online softmax, exactness, IO not FLOPs, then the batch-1 caveat
+and split-KV. The one anchor with no repo number behind it, so the derivation has to carry it.</li>
+<li><b>The KV-cache OOM.</b> 28 KiB analytical against 62 KiB measured, the <code>torch.cat</code>
+double-copy that explains the 2.21x, then fragmentation at the crash: 1.3 GiB free and unusable.</li>
+<li><b>The batching knee.</b> 88.6 to 2696 tok/s, the <code>T_fixed + c1 x batch</code> derivation,
+the knee at 64, and the 3090 control.</li>
+<li><b>HF versus vLLM.</b> The 2x2 ablation, 90% idle and 9% kernels, and the non-additivity of
+compile and graphs.</li>
+</ol>
+
+<div class="key"><b>The interruption drill.</b> Have someone stop you mid-answer with "wait, why is
+it 2 KV heads and not 12?" or "why does that factor of 2 appear twice?" and resume. Interviews are
+not monologues. An answer that only works uninterrupted is a memorised answer, and the difference is
+visible from across a table.</div>
+
+<h3>14.4 The three sentences most likely to be challenged</h3>
+<table>
+<tr><th>What you said</th><th>The challenge</th><th>The prepared answer</th></tr>
+<tr><td>"Decode is memory-bound."</td><td>"Then why is your GPU 62% idle rather than
+bandwidth-saturated?"</td><td>Both are true and they are different layers. The kernel is
+memory-bound; the step is launch-bound. HF's decode achieved only 15-20% MBU precisely because idle
+dominated. vLLM removed the idle and reached 85% of achievable bandwidth, at which point the
+memory-bound claim is what remains.</td></tr>
+<tr><td>"vLLM is 3.2x faster."</td><td>"Your two files say 79.9 and 88.6 tok/s. Which is it?"</td>
+<td>79.9 is the standalone baseline script, 88.6 is batch 1 of the sweep, run under a different pool
+configuration and a different vLLM build. I quote 3.2x from the baseline pair because that is the
+matched comparison; the sweep number is internally consistent with the rest of the sweep.</td></tr>
+<tr><td>"68% of peak bandwidth."</td><td>"Which peak?"</td><td>Against the 360 GB/s spec figure.
+Against the 291.5 GB/s I measured with a read benchmark on the same card, it is 85%. I quote the
+measured ceiling, because the spec number is a number no kernel on this card reaches.</td></tr>
+</table>
+
+<h3>14.5 Exit bar for Week 2</h3>
+<ol class="tight">
+<li>Derive the online-softmax rescale on a whiteboard with no notes and verify it against a direct
+four-element computation.</li>
+<li>State why FlashAttention does nothing for batch-1 decode, and what does instead.</li>
+<li>Tell the OOM story in under 90 seconds with four numbers in it.</li>
+<li>Name the two batching plateaus, their values, and the distinct mechanism behind each.</li>
+<li>Give the idle-versus-kernel split of the vLLM win, and say why the two optimizations are not
+additive.</li>
+</ol>
+
+<!-- ===================== DAY 15 ===================== -->
+<h2 class="day">Day 15 &nbsp;&middot;&nbsp; Quantization, part 1: the argument, in bytes</h2>
+
+<p>Quantization is a <b>differentiator</b> topic rather than a guaranteed one, and the goal for these
+two days is one paragraph of mechanism per method plus one measured result that is genuinely your
+own. Day 15 builds the argument from the roofline. Day 16 does the methods, and then the result that
+contradicts the argument.</p>
+
+<h3>15.1 Why quantization helps inference at all</h3>
+<p>Start where Day 5 ended. A batch-1 decode step reads all <b>3.09 GB</b> of fp16 weights to produce
+a single token, and does about <code>2 x 1.54e9 = 3.1 GFLOP</code> of arithmetic doing it. That is an
+arithmetic intensity near 1 FLOP/byte, against a ridge point of 142. The step is nowhere near the
+compute ceiling and is entirely a memory-traffic problem.</p>
+<p>So the lever is bytes. If the same computation can be driven from weights stored in 4 bits instead
+of 16, the dominant term in the step shrinks by 4x, and per-token latency should follow.</p>
+
+<div class="ex"><span class="lbl">Example 15-A: the ideal bandwidth floor at each width</span>
+<pre>weights = 1,543,714,304 params
+
+fp16   2 bytes/param  = 3.087 GB  -> 3.087 / 291.5 GB/s = 10.6 ms/token  ( 94 tok/s)
+int8   1 byte /param  = 1.544 GB  -> 1.544 / 291.5      =  5.3 ms/token  (189 tok/s)
+int4   0.5 byte/param = 0.772 GB  -> 0.772 / 291.5      =  2.6 ms/token  (378 tok/s)
+
+291.5 GB/s is the MEASURED achievable read bandwidth on this card,
+not the 360 GB/s spec figure. quoting the spec figure inflates every
+line above by 23%.</pre>
+</div>
+
+<div class="key"><b>The sentence to have ready.</b> "Weight-only quantization is a bandwidth play,
+not a compute play. At batch 1 the arithmetic intensity is about 1 against a ridge of 142, so I am
+paying for bytes moved and not for FLOPs done. Halving the bytes is the whole mechanism, and it
+follows that the win shrinks as batch size grows, because batching amortises the same weight read
+over more tokens and moves the step toward the compute-bound side."</div>
+
+<h3>15.2 The corollary that most people miss</h3>
+<p>If quantization wins by shrinking a <i>shared</i> read, then its benefit is largest exactly where
+that read is least amortised: batch 1. At batch 64, the same 3.09 GB is already being spread across
+64 tokens, so the weight term is 64x less important per token and the step has moved toward the
+skinny-GEMM ceiling from Day 13. This is checkable against the measured numbers.</p>
+<pre>batch  1:  T_fixed ~ 11 ms   is essentially ALL of the 11.28 ms step
+batch 64:  T_fixed ~ 11 ms   is 11 of a 23.73 ms step, so ~46%
+           the other ~54% is c1 x 64 = 12.7 ms of per-sequence work
+
+halving the weight bytes attacks T_fixed only:
+  batch  1:  11.28 -> ~5.8 ms    (about 1.9x faster)
+  batch 64:  23.73 -> ~18.2 ms   (about 1.3x faster)</pre>
+<p>Same optimization, very different payoff, and the reason is a decomposition already measured. That
+is the kind of answer that shows a model rather than a memorised fact.</p>
+
+<h3>15.3 What actually gets quantized, and what does not</h3>
+<table>
+<tr><th>Tenant</th><th>Size here, fp16</th><th>Quantized?</th><th>Note</th></tr>
+<tr><td>Weights</td><td>2945 MiB resident</td><td>Yes, the usual target</td>
+<td>Static, shared across all sequences, read every step. Ideal target.</td></tr>
+<tr><td>KV cache</td><td>28 KiB/token analytical</td><td>Sometimes, to int8 or fp8</td>
+<td>Grows with context and batch. Quantizing it buys context length directly.</td></tr>
+<tr><td>Activations</td><td>small at batch 1</td><td>Only in W8A8 schemes</td>
+<td>Where the outlier problem lives. This is what SmoothQuant is about.</td></tr>
+<tr><td>Attention scratch</td><td>~700 MiB at 120k ctx</td><td>No</td>
+<td>Transient. Showed up in the OOM sweep as the residual above weights + 2 x KV.</td></tr>
+</table>
+
+<h3>15.4 The dequantization tax, stated before you meet it</h3>
+<p>A 4-bit weight is not something an Ampere tensor core can multiply. sm_86 has no int4 or fp8 tensor
+path that a general GEMM can use here, so the actual execution is:</p>
+<pre>for each weight tile:
+    read 4-bit packed values from HBM        <- the saving, real
+    look up / scale them back into fp16      <- the tax, per element
+    feed fp16 tensor cores                   <- unchanged arithmetic</pre>
+<p>The read shrinks by 4x. The arithmetic does not shrink at all, and a dequantization step is added
+that did not exist before. Whether this is a win depends entirely on whether the step was actually
+bottlenecked on that read. Hold that thought: it is exactly what the measurement on Day 16 tests, and
+it is exactly where the measurement goes against the story.</p>
+
+<h3>15.5 Formats, precisely enough to be challenged on</h3>
+<table>
+<tr><th>Format</th><th>Bits</th><th>What it is</th></tr>
+<tr><td>fp16</td><td>16</td><td>1 sign, 5 exponent, 10 mantissa. The baseline of record here.</td></tr>
+<tr><td>bf16</td><td>16</td><td>1 sign, 8 exponent, 7 mantissa. Same range as fp32, less precision.
+Not used in this repo, deliberately, for comparability with V100 and T4 runs later.</td></tr>
+<tr><td>int8</td><td>8</td><td>Uniform grid, needs a scale (and sometimes a zero point) per tensor,
+per channel, or per group. Symmetric per-channel is the common serving choice.</td></tr>
+<tr><td>int4 / NF4</td><td>4</td><td>16 levels. NF4 places those levels at the quantiles of a normal
+distribution rather than uniformly, because trained weights are approximately Gaussian, so a uniform
+grid wastes most of its codes on the tails.</td></tr>
+<tr><td>fp8 (e4m3/e5m2)</td><td>8</td><td>Hopper-class hardware feature. Nameable, not measurable on
+sm_86. Correct answer here is "aware of it, cannot measure it on my card".</td></tr>
+</table>
+
+<div class="key"><b>Why NF4 rather than plain int4.</b> Quantization error is minimised by putting
+your 16 available codes where the mass of the distribution is. Trained weights are roughly zero-mean
+Gaussian, so NF4 spaces its levels at the quantiles of a normal, making the codes information-
+theoretically optimal for that assumption. Combined with block-wise scaling (a separate scale per 64
+weights, so one outlier cannot flatten a whole tensor) and double quantization (quantizing those
+scales too), that is the QLoRA recipe.</div>
+
+<!-- ===================== DAY 16 ===================== -->
+<h2 class="day">Day 16 &nbsp;&middot;&nbsp; Quantization, part 2: the methods, and the run that got slower</h2>
+
+<h3>16.1 The four methods, one paragraph of mechanism each</h3>
+<table>
+<tr><th>Method</th><th>The mechanism, in one sentence</th><th>What it is really solving</th></tr>
+<tr><td><b>GPTQ</b></td><td>Quantize weights one column at a time and, after each one, update the
+remaining unquantized columns to compensate for the error just introduced, using second-order
+(Hessian) information from a small calibration set.</td><td>Rounding error is not independent across
+weights. Greedy per-weight rounding compounds; error-compensating rounding does not.</td></tr>
+<tr><td><b>AWQ</b></td><td>Observe that a small fraction of weight channels (about 1%) matter far more
+for output quality, identify them from <i>activation</i> magnitudes rather than weight magnitudes, and
+scale those channels up before quantizing so they land on a finer part of the grid.</td>
+<td>Not all weights are equally important, and importance is visible in the activations, not in the
+weights themselves.</td></tr>
+<tr><td><b>SmoothQuant</b></td><td>Activations have huge outliers and weights do not, which makes W8A8
+fail on the activation side. Migrate the difficulty: divide activations by a per-channel factor
+<code>s</code> and multiply the corresponding weight channels by <code>s</code>, leaving the product
+unchanged but making both sides quantizable.</td><td>An algebraic identity used to move dynamic range
+from the tensor that cannot take it to the one that can.</td></tr>
+<tr><td><b>LLM.int8()</b></td><td>Past roughly 6.7B parameters, a few hidden dimensions develop
+systematic activation outliers that dominate the result. Decompose the matmul: run those few outlier
+dimensions in fp16 and everything else in int8, then add the two results.</td><td>Establishing that
+the outliers are a small, identifiable, structured set rather than noise, which is what makes mixed
+precision practical.</td></tr>
+</table>
+
+<p>The organising observation across all four: <b>the hard part of quantization is not the rounding,
+it is the outliers.</b> GPTQ compensates for their error, AWQ protects them, SmoothQuant relocates
+them, LLM.int8() isolates them. Four answers to one problem is a much better framing than four
+unrelated acronyms.</p>
+
+<h3>16.2 KV-cache quantization, which is a different lever entirely</h3>
+<p>Weight quantization shrinks a fixed cost. KV quantization shrinks a <i>growing</i> one, which
+matters on exactly the axis the OOM experiment measured.</p>
+<pre>analytical KV at fp16      = 28 KiB/token
+analytical KV at int8      = 14 KiB/token
+
+at the measured slope of 62 KiB/token, weights+KV filled 12GB at 123,565 tokens.
+halving only the KV term does not halve the slope, because the measured slope
+includes HuggingFace's double-copy: peak is weights + 2 x KV, not weights + KV.
+which is the useful point: a paged engine gets the full benefit, a torch.cat
+loop gets the benefit twice over on a term that should never have doubled.</pre>
+<p>The interview version: KV quantization is the one quantization lever whose payoff scales with
+context length and batch size, so it is the one that matters for long-context serving, while weight
+quantization is the one that matters for batch-1 latency and for fitting the model at all.</p>
+
+<h3>16.3 The measured result: NF4 on this model and card</h3>
+<p>The same harness, the same 512-token prompt, the same 255 decode tokens, the same script. Only the
+dtype changed. Six fp16 runs and six NF4 runs.</p>
+
+<div class="ex"><span class="lbl">Example 16-A: NF4 against fp16, from results/baseline_hf.csv</span>
+<pre>                        fp16        NF4        change
+weights resident     2945.29     1099.13 MiB   2.68x SMALLER
+peak reserved        3360.00     1394.00 MiB   1966 MiB freed
+prefill tok/s           4207        3652       13.2% slower
+decode  tok/s          28.16       12.42       2.27x SLOWER
+decode  ms/token       35.51       80.52       +45.0 ms per token
+
+the memory result is exactly as predicted. the latency result is
+backwards, and by a lot.</pre>
+</div>
+
+<div class="key"><b>The trap question, and it will be asked.</b> "You just told me weight-only
+quantization is a bandwidth play. Your 4-bit run reads 2.68x fewer weight bytes. Why did it get
+2.27x slower?" Anyone who has only read about quantization stalls here. The answer is in this repo's
+own profiling data.</div>
+
+<h3>16.4 The answer, in three steps</h3>
+<p><b>Step 1: the bandwidth win is real, and it is not the bottleneck.</b> The fp16 HuggingFace decode
+step is <b>62.3% device idle</b> and fires 1198 kernels per token. It was never running at the
+bandwidth ceiling; it reached only 15-20% MBU. An optimization that reduces bytes read cannot help a
+step that is not waiting on bytes read. It is Amdahl's law applied to the wrong term.</p>
+
+<pre>fp16 decode, HF:   35.51 ms/token, of which ~62% is device idle
+                   -> ~13.4 ms of actual device work
+                   3.087 GB / 13.4 ms = 230 GB/s ... but that is the BUSY
+                   window only. across the whole step it is 87 GB/s, ~24% of
+                   the 360 GB/s spec figure. bytes were never the constraint.</pre>
+
+<p><b>Step 2: dequantization adds work to a step that was already launch-bound.</b> Every quantized
+linear layer now runs a dequantize kernel before its GEMM. That is more kernels and more launches per
+token, on a loop where 62.3% of the time was already dispatch overhead. The optimization made the
+dominant term worse.</p>
+
+<pre>effective bandwidth achieved, whole step:
+  fp16:  3.087 GB / 35.51 ms  =  86.9 GB/s
+  NF4:   1.152 GB / 80.52 ms  =  14.3 GB/s
+
+the NF4 run moves 2.68x fewer bytes in 2.27x more time. the extra
+45.0 ms/token is not memory traffic at all. it is dequantization plus
+the launches that carry it.</pre>
+
+<p><b>Step 3: the caveat that makes the answer correct rather than merely defensive.</b> This measures
+<i>this</i> implementation on <i>this</i> card. bitsandbytes NF4 dequantizes to fp16 and calls an fp16
+GEMM, and sm_86 has no int4 tensor-core path to skip that with. A serving stack with fused
+dequantize-and-matmul kernels, such as Marlin or an AWQ or GPTQ kernel in vLLM, folds the
+dequantization into the GEMM's prologue and does realise the bandwidth win. The result here is
+correct and specific, not a claim that 4-bit quantization is useless.</p>
+
+<h3>16.5 What the run <i>did</i> buy, quantified</h3>
+<p>The memory result is the real win and it converts directly into the other headline experiment.</p>
+<pre>weights freed = 2945.29 - 1099.13 = 1846.16 MiB
+
+at the MEASURED OOM slope of 62 KiB/token:
+    1846.16 MiB x 1024 / 62 KiB = 30,489 more tokens of context
+
+at the ANALYTICAL 28 KiB/token (what a paged engine would actually see):
+    1846.16 x 1024 / 28        = 67,511 more tokens of context
+
+so on the same 12GB card, NF4 moves the OOM cliff from 123,565 tokens to
+roughly 154,000 in the HF loop. it buys context, not speed.</pre>
+
+<div class="key"><b>The complete answer, as one paragraph.</b> "Weight-only quantization is a
+bandwidth play, so I expected 4-bit to be faster at batch 1. It was 2.27x slower. The reason is that
+my baseline was not bandwidth-bound: profiling showed the HF decode step was 62.3% device idle across
+1198 kernel launches, running at under a quarter of peak bandwidth. Shrinking the bytes attacks a
+term that was not binding, while dequantization adds kernels to the term that was. It is
+bitsandbytes-specific and card-specific, because sm_86 has no int4 tensor path, so the dequantize is
+a separate step rather than a fused GEMM prologue. What the run did buy is memory: 1846 MiB of
+weights freed, which is about 30,000 more tokens of context at my measured KV slope. Quantization
+bought me context, not latency, and the profiler explains exactly why."</div>
+
+<h3>16.6 Self-test, Days 15-16</h3>
+<p><b>Q1. Why does quantization help inference more than it helps training?</b><br>
+Inference at low batch is memory-bound with arithmetic intensity near 1 against a ridge of 142, so
+the cost is bytes moved and weights are the largest static tenant. Training is compute-bound, has a
+backward pass and optimizer state, and needs gradient precision. Quantization attacks the term that
+dominates inference and not the one that dominates training.</p>
+<p><b>Q2. Would you expect a bigger or smaller win from quantization at batch 64 than at batch 1?</b><br>
+Smaller. The weight read is <code>T_fixed</code>, about 11 ms, and it is essentially the entire
+11.28 ms step at batch 1 but only about 46% of the 23.73 ms step at batch 64, because
+<code>c1 x batch</code> has grown to 12.7 ms. Halving the weight bytes gives roughly 1.9x at batch 1
+and roughly 1.3x at batch 64, on my own decomposition.</p>
+<p><b>Q3. GPTQ and AWQ both do 4-bit weight-only. What is actually different?</b><br>
+GPTQ is error compensation: quantize column by column and update the not-yet-quantized columns with
+Hessian information so the accumulated error is corrected. AWQ is error avoidance: find the roughly
+1% of channels that matter, identified from activation magnitudes rather than weight magnitudes, and
+scale them so they land on a finer part of the grid. One repairs the damage, the other steers around
+it.</p>
+<p><b>Q4. Your 4-bit run got slower. Does that mean quantization does not work?</b><br>
+No, it means my baseline was not bandwidth-bound and my kernel was not fused. The step was 62.3%
+idle across 1198 launches, so cutting bytes could not help, and bitsandbytes NF4 dequantizes into a
+separate fp16 GEMM because sm_86 has no int4 tensor path. A fused dequantize-and-matmul kernel such
+as Marlin on a stack that is actually bandwidth-bound is the configuration where the win appears.
+I measured one point precisely, and I can say exactly which of its assumptions to change.</p>
+
+<p class="links"><b>Sources:</b>
+<a href="https://arxiv.org/abs/2210.17323">Frantar et al., GPTQ</a> &middot;
+<a href="https://arxiv.org/abs/2306.00978">Lin et al., AWQ</a> &middot;
+<a href="https://arxiv.org/abs/2211.10438">Xiao et al., SmoothQuant</a> &middot;
+<a href="https://arxiv.org/abs/2208.07339">Dettmers et al., LLM.int8()</a> &middot;
+<a href="https://arxiv.org/abs/2305.14314">Dettmers et al., QLoRA (NF4)</a> &middot;
+<a href="https://github.com/IST-DASLab/marlin">Marlin, fused 4-bit GEMM kernels</a></p>
+
+<hr>
+<p class="small">Repo sources for every measured number above:
+<code>results/vllm_batch_sweep.csv</code> (both pool configurations and both GPUs),
+<code>results/baseline_hf.csv</code> (the fp16 and NF4 rows),
+<code>results/profile_summary.csv</code>, <code>results/oom_sweep.csv</code>,
+<code>docs/batching-results.md</code>, <code>docs/profiling.md</code>,
+<code>docs/oom-results.md</code>. Batch-sweep throughput is the
+<code>decode_throughput_tok_s</code> column, averaged over repeats. fp16-versus-NF4 decode figures
+are means over the six runs of each dtype. Where a CSV and a prose doc disagree, the CSV is used.</p>
