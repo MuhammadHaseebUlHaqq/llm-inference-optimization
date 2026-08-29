@@ -1,0 +1,631 @@
+<meta charset="utf-8">
+<title>Days 17-21: Speculative Decoding, Tensor Parallelism, Reconciliation, Synthesis</title>
+<style>
+@page { size: A4; margin: 14mm 15mm 14mm 15mm; }
+* { box-sizing: border-box; }
+body { font-family: "Charter", "Georgia", serif; font-size: 10.2pt; line-height: 1.38; color: #16181d; }
+h1 { font-size: 19pt; margin: 0 0 2px 0; line-height: 1.15; }
+h2 { font-size: 13pt; margin: 16px 0 6px 0; padding: 4px 0 4px 8px;
+     border-left: 4px solid #2b5fa8; background: #eef2f8; page-break-after: avoid; }
+h3 { font-size: 11pt; margin: 11px 0 4px 0; color: #1c3f70; page-break-after: avoid; }
+p { margin: 5px 0; }
+ul, ol { margin: 5px 0 5px 0; padding-left: 19px; }
+li { margin: 2px 0; }
+code, pre { font-family: "Consolas", "DejaVu Sans Mono", monospace; }
+code { font-size: 9pt; background: #f2f3f5; padding: 0 2px; border-radius: 2px; }
+pre { font-size: 8.6pt; background: #f7f8fa; border: 1px solid #dde1e8; border-radius: 3px;
+      padding: 6px 8px; margin: 6px 0; line-height: 1.32; white-space: pre-wrap;
+      overflow-x: auto; page-break-inside: avoid; }
+table { border-collapse: collapse; width: 100%; margin: 6px 0; font-size: 9.2pt;
+        page-break-inside: avoid; }
+th, td { border: 1px solid #ccd2dc; padding: 3px 6px; text-align: left; vertical-align: top; }
+th { background: #eef2f8; font-weight: 600; }
+.sub { color: #55606f; font-size: 10pt; margin: 0 0 10px 0; }
+.ex { border: 1px solid #b9cbe4; background: #f4f8fd; border-radius: 3px;
+      padding: 6px 9px; margin: 7px 0; page-break-inside: avoid; }
+.ex .lbl { font-family: Consolas, monospace; font-size: 8.4pt; font-weight: 700;
+           letter-spacing: .04em; color: #2b5fa8; text-transform: uppercase; display: block;
+           margin-bottom: 3px; }
+.key { border-left: 3px solid #c58b00; background: #fdf7e8; padding: 5px 9px; margin: 7px 0;
+       page-break-inside: avoid; }
+.key b { color: #8a6100; }
+a { color: #2b5fa8; text-decoration: none; }
+.links { font-size: 8.9pt; color: #55606f; margin: 5px 0 0 0; }
+.day { page-break-before: always; }
+.tight li { margin: 1px 0; }
+hr { border: 0; border-top: 1px solid #dde1e8; margin: 14px 0 0 0; }
+.small { font-size: 9pt; color: #55606f; }
+</style>
+
+<h1>Days 17-21</h1>
+<p class="sub">Speculative decoding, tensor parallelism, the reconciliation pass over the repo, and
+two days of synthesis. The last block of the three-week plan. Same model and card: Qwen2.5-1.5B,
+fp16, one RTX 3060 12GB.</p>
+
+<table>
+<tr><th>Day</th><th>Topic</th><th>The one thing you must be able to derive</th></tr>
+<tr><td>17</td><td>Speculative decoding</td><td>Why it works at all, from your own step-time model</td></tr>
+<tr><td>18</td><td>Tensor parallelism, and repo repair</td><td>Two all-reduces per layer, and why 2 KV heads caps TP at 2</td></tr>
+<tr><td>19</td><td>Synthesis: the layer table</td><td>Concept, equation, and proving experiment, for every layer</td></tr>
+<tr><td>20</td><td>Synthesis: the four anchors</td><td>All four, cold, timed, interrupted</td></tr>
+<tr><td>21</td><td>Buffer and posture</td><td>What you are deliberately not learning, said confidently</td></tr>
+</table>
+
+<div class="key"><b>The shift in these five days.</b> Days 1 to 16 were acquisition. Days 17 to 21 are
+almost entirely retrieval and repair. Day 18 is the only day whose deliverable is a commit rather
+than a rehearsal, and it is there because an interviewer who opens the repo will find the
+inconsistencies before you get a chance to explain them.</div>
+
+<!-- ===================== DAY 17 ===================== -->
+<h2>Day 17 &nbsp;&middot;&nbsp; Speculative decoding: buying tokens with spare arithmetic</h2>
+
+<p>This is a technique that was not run in this repo, which changes how it should be answered. Do not
+claim a measurement. Instead, derive why it works from the step-time model that <i>was</i> measured,
+and state the break-even condition. A derived projection with an explicit "I have not run this" is a
+much better answer than a recited paper summary.</p>
+
+<h3>17.1 The observation the whole technique rests on</h3>
+<p>From Day 13: a decode step costs <code>T_fixed + c1 x batch</code>, with <code>T_fixed</code>
+around 11 ms and <code>c1</code> around 0.20 ms per sequence. <code>T_fixed</code> is the shared
+weight read, 3.09 GB streamed to advance the sequence by <b>one</b> token. The tensor cores are idle
+through nearly all of it: arithmetic intensity around 1 against a ridge point of 142.</p>
+<p>Now ask the key question. If instead of one token, the same forward pass scored <i>six</i>
+candidate tokens, what would it cost? Almost the same, because the 3.09 GB weight read does not
+change and the extra arithmetic is free at intensity 1. The GPU has been doing nothing with its
+arithmetic for the entire step.</p>
+
+<div class="key"><b>The one-sentence version.</b> "Decode is memory-bound, so verifying k drafted
+tokens in a single forward pass costs about the same as generating one, since you re-use the same
+weight read. Speculative decoding spends the arithmetic that a memory-bound step was wasting anyway,
+and buys tokens with it."</div>
+
+<h3>17.2 The algorithm, in four steps</h3>
+<ol class="tight">
+<li><b>Draft.</b> A small, fast model generates <code>k</code> candidate tokens autoregressively.</li>
+<li><b>Verify.</b> The large target model runs one forward pass over the prompt plus all
+<code>k</code> drafts, producing its own distribution at every one of those positions.</li>
+<li><b>Accept or reject.</b> Walk the drafts left to right. Accept a token with probability
+<code>min(1, p_target(x) / p_draft(x))</code>. Stop at the first rejection.</li>
+<li><b>Correct.</b> At the rejection point, sample from the residual distribution
+<code>norm(max(0, p_target - p_draft))</code>. If all <code>k</code> were accepted, sample one bonus
+token from the target's distribution at position <code>k+1</code>, which the verify pass already
+computed for free.</li>
+</ol>
+<p>So a round produces between 1 and <code>k+1</code> tokens, and never zero. That floor of 1 is
+what makes the technique safe: the worst case is a wasted draft, not a stall.</p>
+
+<h3>17.3 Why the output distribution is exactly unchanged</h3>
+<p>This is the property to be able to state precisely, and it is the reason speculative decoding is
+called lossless rather than approximate.</p>
+<p>The accept rule plus the residual-sampling correction together produce samples from
+<code>p_target</code> exactly. Intuitively: accepting with probability
+<code>min(1, p_target/p_draft)</code> keeps a token whenever the target likes it at least as much as
+the draft did; where the draft over-proposed a token, the shortfall is exactly the mass
+<code>max(0, p_target - p_draft)</code>, and sampling the rejection from that renormalised residual
+puts the mass back where the target wanted it. Summed over both branches, the probability of emitting
+any given token is <code>p_target</code>. It is the same trick as rejection sampling with a proposal
+distribution, applied per position.</p>
+<p><b>The consequence to say out loud:</b> the draft model's quality affects <i>speed only</i>, never
+output quality. A bad draft model means a low acceptance rate and a slow run, not a worse answer.
+That is why speculative decoding is deployable in a way that, say, aggressive quantization is not.</p>
+
+<h3>17.4 The break-even condition, computed from this repo's own constants</h3>
+<p>Everything below is a <b>projection from measured constants</b>, not a measurement. Say so.</p>
+
+<div class="ex"><span class="lbl">Example 17-A: the cost model, built from the measured T_fixed and c1</span>
+<pre>MEASURED, this repo:
+  T_fixed = 11 ms       shared weight read, 3.09 GB of fp16 weights
+  c1      = 0.20 ms     marginal cost per extra sequence in the batch
+  baseline batch-1 step = 11.28 ms/token   (vLLM, RTX 3060)
+
+PROJECTED draft cost. Qwen2.5-0.5B as the draft: 494M params = 0.99 GB fp16.
+Decode is weight-read-bound, so scale T_fixed by the weight-byte ratio:
+  T_draft = 11 ms x (0.99 / 3.09) = 3.5 ms per drafted token
+
+PROJECTED verify cost. One forward pass over k+1 positions of ONE sequence,
+so the weight read is paid once and the extra positions cost roughly c1 each:
+  T_verify(k) = 11 + 0.20 x (k+1) ms
+
+ROUND COST:
+  T_round(k) = k x 3.5 + T_verify(k)
+
+TOKENS PER ROUND, with per-token acceptance probability a (geometric):
+  E[tokens] = (1 - a^(k+1)) / (1 - a)</pre>
+</div>
+
+<div class="ex"><span class="lbl">Example 17-B: projected speedup against baseline, by draft length and acceptance rate</span>
+<pre>                  k=1        k=3        k=5        k=7
+round cost:     14.7 ms    22.3 ms    29.7 ms    37.1 ms
+
+ a = 0.5         1.15x      0.95x      0.75x      0.60x
+ a = 0.7         1.30x      1.28x      1.12x      0.98x
+ a = 0.8         1.38x      1.49x      1.40x      1.26x
+ a = 0.9         1.46x      1.74x      1.78x      1.73x
+
+read the table two ways:
+  DOWN a column: longer drafts only pay if acceptance is high.
+  ACROSS a row:  the optimal k RISES with the acceptance rate.
+                 k=1 at a=0.5, k=3 at a=0.8, k=5 at a=0.9.
+
+and note the entries below 1.00x. at a = 0.5 with k = 5 speculative
+decoding is 25% SLOWER than just decoding, because 17.5 ms of drafting
+buys, on average, 1.97 tokens.</pre>
+</div>
+
+<p>Break-even for <code>k = 5</code>: the round must yield <code>29.7 / 11.28 = 2.63</code> tokens
+to be worth running at all. That is the number to quote. It converts a vague "acceptance rate
+matters" into a threshold.</p>
+
+<h3>17.5 Why the win is capped, and where it disappears</h3>
+<ul class="tight">
+<li><b>It is a latency technique, not a throughput technique.</b> It works by spending idle
+arithmetic. At batch 64 that arithmetic is no longer idle: from Day 13, the step is already at its
+skinny-GEMM ceiling and <code>c1 x batch</code> is 54% of the step. Speculation and batching compete
+for the same resource, and batching usually wins on a loaded server.</li>
+<li><b>It costs KV memory.</b> The drafts occupy KV blocks during verification, and rejected ones
+must be rolled back. On a card that OOMs at 123,565 tokens, that is not free.</li>
+<li><b>Acceptance rate is workload-dependent.</b> Code and structured text draft well because they are
+predictable; open-ended creative text drafts badly. A number measured on one workload does not
+transfer.</li>
+</ul>
+
+<h3>17.6 Medusa and EAGLE, one sentence each</h3>
+<table>
+<tr><th>Variant</th><th>The change</th><th>Why it is an improvement</th></tr>
+<tr><td><b>Medusa</b></td><td>Delete the separate draft model. Bolt several extra decoding heads onto
+the target model itself, each predicting one position further ahead, and verify their combined
+candidates as a tree.</td><td>Removes the draft model's weight read entirely, which in the table
+above is the <code>k x 3.5 ms</code> term, the dominant cost of a round.</td></tr>
+<tr><td><b>EAGLE</b></td><td>Draft in <i>feature</i> space rather than token space: autoregress over
+the target model's second-to-top hidden states, which is a much easier prediction problem than
+predicting the token, and resolves to tokens only at the end.</td><td>Raises the acceptance rate,
+which the table shows is the variable that decides everything. Moving from a = 0.7 to a = 0.9 at
+k = 5 goes from 1.12x to 1.78x.</td></tr>
+</table>
+
+<h3>17.7 Self-test, Day 17</h3>
+<p><b>Q1. Why does verifying five tokens cost about the same as generating one?</b><br>
+Because batch-1 decode is memory-bound at an arithmetic intensity near 1 against a ridge of 142. The
+cost is the 3.09 GB weight read, which a single forward pass pays once no matter how many query
+positions it scores. On my measurements that read is <code>T_fixed</code>, about 11 ms of an 11.28 ms
+step, and the extra positions cost roughly <code>c1 = 0.20</code> ms each.</p>
+<p><b>Q2. Does speculative decoding change the model's output?</b><br>
+No, and that is the point of the accept-reject rule. Accept with probability
+<code>min(1, p_target/p_draft)</code>, and on rejection sample from the normalised residual
+<code>max(0, p_target - p_draft)</code>. The two branches sum to exactly <code>p_target</code>. The
+draft model's quality determines speed, never quality.</p>
+<p><b>Q3. When would you not use it?</b><br>
+When acceptance is low or the server is loaded. On my step-time constants, k=5 with a 0.5 acceptance
+rate is 25% slower than plain decoding, because the round costs 29.7 ms and yields 1.97 tokens
+against a break-even of 2.63. And at high batch the idle arithmetic it exploits is already spoken
+for: at batch 64 more than half my step is per-sequence work, not the shared weight read.</p>
+
+<p class="links"><b>Sources:</b>
+<a href="https://arxiv.org/abs/2211.17192">Leviathan et al., Fast Inference via Speculative Decoding</a> &middot;
+<a href="https://arxiv.org/abs/2302.01318">Chen et al., Accelerating LLM decoding with speculative sampling</a> &middot;
+<a href="https://arxiv.org/abs/2401.10774">Cai et al., Medusa</a> &middot;
+<a href="https://arxiv.org/abs/2401.15077">Li et al., EAGLE</a></p>
+
+<!-- ===================== DAY 18 ===================== -->
+<h2 class="day">Day 18 &nbsp;&middot;&nbsp; Tensor parallelism (45 minutes), then repo reconciliation</h2>
+
+<p>Two unequal halves. Tensor parallelism gets 45 minutes because there is one GPU here and a TP claim
+cannot be defended with anything but a paper. The rest of the day goes to fixing four places where a
+document has drifted from its own CSV, which is a real deliverable and a better research signal than
+one more topic.</p>
+
+<h3>18.1 Tensor parallelism: the split, and the two all-reduces</h3>
+<p>Split each layer's weights across GPUs so every device holds a slice and they cooperate on one
+forward pass. Megatron's arrangement, which everything since copies:</p>
+<pre>ATTENTION
+  split by HEAD. each GPU gets a subset of the query heads and their
+  matching KV heads, computes attention for those heads only, and holds
+  the corresponding COLUMN slice of o_proj.
+  -> one all-reduce after o_proj to sum the partial outputs.
+
+MLP
+  gate_proj and up_proj are split COLUMN-wise (each GPU gets a slice of
+  the 8960-wide intermediate). down_proj is split ROW-wise to match.
+  -> one all-reduce after down_proj.
+
+TOTAL: 2 all-reduces per transformer layer, per token.
+For this model: 28 layers x 2 = 56 collectives per decode step.</pre>
+
+<div class="key"><b>The model-specific constraint that makes this concrete.</b> Qwen2.5-1.5B has 12
+query heads and <b>2 KV heads</b> under GQA. Tensor parallelism splits by head, so the KV heads cap
+the degree: TP=2 gives each GPU 6 query heads and 1 KV head, which is clean. TP=4 cannot split 2 KV
+heads four ways, so it has to <i>replicate</i> them, which means every GPU stores the full KV cache
+for its replicated head and the memory saving TP was supposed to give partly evaporates. GQA and
+tensor parallelism interact, and this is the sentence that shows it.</div>
+
+<h3>18.2 Why it wants NVLink, in bytes and in microseconds</h3>
+<div class="ex"><span class="lbl">Example 18-A: the collective cost at batch 1, TP=2</span>
+<pre>hidden = 1536, fp16. one all-reduce moves one hidden vector per token:
+  1536 x 2 bytes = 3072 B = 3 KiB
+
+per decode step: 56 all-reduces x 3 KiB = 168 KiB of traffic per token.
+
+BYTES: 168 KiB over PCIe 4.0 x16 (~25 GB/s) = 6.9 us. nothing.
+LATENCY: each collective costs a fixed launch-plus-sync of roughly
+  8 us over PCIe, or roughly 2 us over NVLink.
+    PCIe:   56 x 8 us = 0.45 ms per token
+    NVLink: 56 x 2 us = 0.11 ms per token
+
+against a TP=2 step of about 5.5 ms (T_fixed halved), that is
+  7.6% overhead on PCIe, 2.0% on NVLink.</pre>
+</div>
+<p>The conclusion is the interesting part: <b>decode-time tensor parallelism is latency-bound on the
+collective, not bandwidth-bound.</b> The payload is 3 KiB. What hurts is paying a synchronisation
+56 times per token, on a step that is only a few milliseconds. That is why NVLink matters for TP and
+why TP degree does not scale gracefully over PCIe. Prefill is the opposite case, because the payload
+scales with sequence length and the bandwidth term starts to matter.</p>
+<p>Projected TP=2 speedup on this model: <code>T_fixed</code> halves from 11 ms to about 5.5 ms, so
+the step goes 11.28 to roughly 5.95 ms including the PCIe collective cost. That is <b>1.9x, not
+2x</b>, and the missing 0.1x is the 56 synchronisations.</p>
+
+<h3>18.3 Pipeline parallelism, one sentence</h3>
+<p>Split the model by <i>layer</i> rather than within a layer, so GPU 0 holds layers 0 to 13 and
+GPU 1 holds 14 to 27. It is a throughput technique, not a latency technique, because a single token
+still traverses every stage in sequence and the pipeline has bubbles at the start and end of every
+batch. Use it when you need to fit a model across nodes; use TP when you need the latency.</p>
+
+<h3>18.4 The reconciliation pass: four documents that disagree with their own data</h3>
+<p>These are live. An interviewer who opens the repo will hit them. Fixing them yourself and being
+able to say "I found four places where a doc had drifted from its CSV, and here is what I changed"
+is a better signal than any additional topic that could be crammed into this day.</p>
+
+<table>
+<tr><th>#</th><th>File and what it says</th><th>What the data says</th><th>The fix</th></tr>
+<tr><td>1</td><td><code>docs/oom-results.md</code>, three places: "~60 KB/token", "roughly 2.15x the
+analytical 28"</td><td><code>results/oom_sweep.csv</code> gives a slope of <b>62 KiB/token</b>,
+<b>2.21x</b> the analytical 28 KiB</td><td>Correct all three to 62 KiB/token and 2.21x, and use KiB
+rather than KB consistently, since the analytical figure is binary.</td></tr>
+<tr><td>2</td><td><code>docs/baseline-hf-results.md</code> line 22: decode "~18-23 tok/s", and the MBU
+paragraph built on 18 and 23</td><td><code>results/baseline_hf.csv</code> settled at
+<b>28.05 to 28.32 tok/s</b> across the last four fp16 runs. The 18.0 and 23.2 figures are two early
+runs before the transformers pin</td><td>Update the headline to ~28 tok/s, recompute the MBU line
+(28.1 tok/s = 35.5 ms/token = 87 GB/s = 24% of 360), and keep the 18/23 runs as an explicit note on
+run-to-run variance rather than as the result.</td></tr>
+<tr><td>3</td><td><code>docs/baseline-vllm-results.md</code>: decode 79.9 tok/s, headline "~4x".
+<code>docs/batching-results.md</code>: batch-1 decode 88.6 tok/s</td><td>Both are real, from different
+runs: 79.9 is the standalone baseline, 88.6 is batch 1 of the sweep under a different pool
+configuration and vLLM build</td><td>Either reconcile or caveat explicitly. The caveat is the honest
+option: state in both files which run each number came from and that they are 11% apart, rather than
+silently quoting whichever is convenient.</td></tr>
+<tr><td>4</td><td>"~4x decode throughput" in three places in
+<code>docs/baseline-vllm-results.md</code></td><td>79.9 / 28.1 = <b>2.84x</b> from the benchmark
+pair. <code>results/profile_summary.csv</code> gives <b>3.24x</b> (40.65 to 12.56 ms per step) from
+the profiling run. Neither is 4x; the 4x came from dividing 79.9 by the stale ~20 tok/s</td>
+<td>Settle on <b>3.2x</b> as the headline, sourced from the profiling run, and say why: it is the
+matched comparison where both engines were measured in the same session with the same harness.</td></tr>
+</table>
+
+<div class="key"><b>Why this is worth a whole day.</b> Every one of these four is the same failure:
+a number was written into prose once and then the experiment was rerun. That is the most common way
+a measurement artifact rots, and noticing it is a research skill. The sentence to have ready is:
+"The CSVs are the record and the prose is a summary of them. Where they disagreed, I found four
+places, the CSV won, and I added a rule to the README saying so."</div>
+
+<h3>18.5 The rest of the reconciliation list</h3>
+<ul class="tight">
+<li><b>Write <code>docs/quantization-results.md</code></b> so the NF4 result has a home matching the
+other three results docs. Content is Day 16: 2.68x smaller weights, 2.27x slower decode, the
+62.3%-idle explanation, the bitsandbytes and sm_86 caveat, and the 30,489 tokens of extra context.</li>
+<li><b>De-duplicate <code>docs/phase1.md</code> against <code>weeks/week2.md</code></b>, which share
+paragraphs verbatim, including the scope statement and the directory tree.</li>
+<li><b>Strip the stale T4 references.</b> <code>docs/phase1.md</code> still opens on "a single Colab
+T4" and its tree still lists a Colab runner notebook. The hardware of record is the Vast.ai RTX 3060.
+Keep the T4 mention only where it is deliberate: the fp16-not-bf16 rule, which exists for
+comparability with later V100 and T4 runs.</li>
+</ul>
+
+<p class="links"><b>Sources:</b>
+<a href="https://arxiv.org/abs/1909.08053">Shoeybi et al., Megatron-LM (tensor parallelism)</a> &middot;
+<a href="https://arxiv.org/abs/2104.04473">Narayanan et al., Efficient large-scale training on GPU clusters (PTD-P)</a> &middot;
+<a href="https://arxiv.org/abs/2305.13245">Ainslie et al., GQA (the head-count constraint)</a></p>
+
+<!-- ===================== DAY 19 ===================== -->
+<h2 class="day">Day 19 &nbsp;&middot;&nbsp; Synthesis 1: concept, equation, proving result, for every layer</h2>
+
+<p>The table below is the artifact of this day, and it should be reproducible from a blank page. The
+discipline is the third column: <b>if a layer has no proving experiment or paper result, that is the
+layer to spend Day 21 on.</b> A concept without a proof attached is the thing that collapses under a
+follow-up question.</p>
+
+<table>
+<tr><th>Layer</th><th>The concept, in one line</th><th>The equation</th><th>What proves it</th></tr>
+<tr><td>1. Architecture</td><td>Attention mixes across positions; the MLP does not. GQA shrinks the
+KV cache by cutting KV heads, not query heads</td><td>KV/token =
+<code>2 x L x H_kv x d_head x 2</code></td><td>My config: 28 KiB/token under GQA against 168 KiB
+under MHA, a 6x ratio, from 2 KV heads against 12 query heads</td></tr>
+<tr><td>2. Inference arithmetic</td><td>Prefill is compute-bound, decode is memory-bound, and the
+difference is arithmetic intensity, not model size</td><td>ridge =
+<code>FLOPS / bandwidth</code> = 51e12/360e9 = 142 FLOP/byte</td><td>Measured 4205 tok/s prefill
+against 28.1 tok/s decode on the same model and card: a 150x per-token gap</td></tr>
+<tr><td>3. KV cache</td><td>The KV cache is a growing tenant, and naive management wastes memory
+three ways: reservation, internal and external fragmentation</td><td>peak =
+<code>weights + 2 x KV</code> for a <code>torch.cat</code> loop</td><td>OOM at 123,565 tokens; slope
+62 KiB/token against 28 analytical; at the crash 1.3 GiB free inside the pool and unusable</td></tr>
+<tr><td>4. GPU architecture</td><td>Kernels are limited by memory movement and occupancy far more
+often than by arithmetic</td><td>MBU = <code>bytes moved / (time x peak bandwidth)</code></td>
+<td>HF decode at 15-20% MBU; vLLM at 85% of the 291.5 GB/s I measured rather than the 360 GB/s
+spec</td></tr>
+<tr><td>5. CUDA and the launch path</td><td>At small kernel sizes the dispatch chain above a kernel
+costs more than the kernel</td><td>step = <code>sum(kernels) + sum(gaps)</code></td>
+<td>HF: 1198 kernels per token, 62.3% device idle, 21.1 us of idle per launch against a 12.8 us
+average kernel</td></tr>
+<tr><td>6. Landmark kernels</td><td>FlashAttention is an IO result, not a FLOPs result, and it does
+nothing at batch-1 decode</td><td>HBM traffic <code>O(N^2) -&gt; O(N)</code>, compute unchanged at
+<code>O(N^2 d)</code></td><td>Derivation, plus my own trace: attention is 0.61 ms of a 12.56 ms
+decode step, under 5%, and 28 flash split-KV kernels fire per step</td></tr>
+<tr><td>7. Serving and scheduling</td><td>Batching converts a memory-bound step into a
+compute-bound one by amortising the shared weight read</td><td>throughput =
+<code>batch / (T_fixed + c1 x batch)</code>, asymptote <code>1/c1</code></td><td>88.6 to 2696 tok/s
+from batch 1 to 64, knee at 64, confirmed unmoved on an RTX 3090</td></tr>
+<tr><td>8. Quantization</td><td>Weight-only quantization is a bandwidth play, so it only pays when
+the step is actually bandwidth-bound</td><td>floor =
+<code>weight bytes / achievable bandwidth</code></td><td>My NF4 run: 2.68x smaller weights, 2.27x
+slower decode, because the baseline was 62.3% idle and dequantization added launches</td></tr>
+<tr><td>9. Speculative decoding</td><td>Verifying k tokens costs about one step, so idle arithmetic
+buys tokens, at a rate acceptance decides</td><td>break-even =
+<code>T_round / T_baseline</code> tokens per round</td><td>Projected from my constants: k=5 needs
+2.63 tokens per round; at a=0.5 it is 0.75x, i.e. slower. Not measured, and I say so</td></tr>
+<tr><td>10. Parallelism</td><td>TP splits within a layer for latency and costs two all-reduces per
+layer; PP splits across layers for throughput and has bubbles</td><td>56 collectives per token for
+28 layers at TP=2</td><td>Paper-level only. My card count is one. The concrete hook I do have is
+that 2 KV heads cap TP at 2 for this model</td></tr>
+</table>
+
+<h3>19.1 The two rows to be honest about</h3>
+<p>Rows 9 and 10 are the only ones whose third column is not a measurement from this repo, and the
+correct move is to say that before being asked. "Everything in this table except speculative decoding
+and parallelism is something I measured on my own hardware. Those two I can derive and place, but I
+have one GPU and I did not run them." Volunteering the boundary of your evidence is what makes the
+rest of the table credible.</p>
+
+<h3>19.2 The single thread that connects all ten rows</h3>
+<div class="key"><b>Say this if asked "what did you actually learn from all this?"</b> "That at batch
+1 on a small model, almost nothing that limits you is arithmetic. My decode step was 62.3% idle, ran
+at 15-20% of memory bandwidth, and did 3.1 GFLOP against a card capable of 51 TFLOPS. Every
+optimization that helped attacked either bytes moved or time not spent computing: CUDA graphs removed
+the idle, fused kernels cut 1198 launches to 356, batching amortised the weight read, PagedAttention
+removed the fragmentation. And the one optimization that attacked bytes when bytes were not the
+constraint, my 4-bit run, made things 2.27x worse. That ordering is the whole lesson."</div>
+
+<!-- ===================== DAY 20 ===================== -->
+<h2 class="day">Day 20 &nbsp;&middot;&nbsp; Synthesis 2: the four anchor answers, cold and timed</h2>
+
+<p>Almost any question routes back to one of these four. Each should take 60 to 90 seconds out loud.
+Deliver each one three times today: once from notes, once from a blank page, once interrupted.</p>
+
+<h3>20.1 Anchor 1: the FlashAttention derivation</h3>
+<p>The only anchor with no supporting number in this repo, so the derivation has to carry it.</p>
+<pre>BEAT 1  standard attention writes the full N x N score matrix to HBM, reads
+        it back for softmax, writes it, reads it again for the V multiply.
+        the FLOPs are unavoidable. the round trips are not.
+
+BEAT 2  the obstacle: softmax needs the whole row for its denominator, which
+        looks incompatible with tiling.
+
+BEAT 3  online softmax fixes it. carry m, l, O. when a tile arrives with a
+        bigger max, rescale by c = exp(m_old - m_new) and continue. exact,
+        not approximate. it is the same max-subtraction you already need for
+        numerical stability, turned into an incremental algorithm.
+
+BEAT 4  so FlashAttention tiles Q, K, V into SRAM and never materialises the
+        score matrix. HBM traffic falls from O(N^2) to O(N); compute is
+        unchanged, and the backward pass does MORE arithmetic by recomputing.
+        it is an IO-complexity result.
+
+BEAT 5  the inference caveat, which is what shows you thought about decode:
+        at batch 1 the score matrix is 1 x n. no quadratic term to avoid, no
+        tile worth keeping. decode's problem is the opposite, not enough
+        parallel work. the answer is flash-decoding / split-KV, which splits
+        the KV sequence across SMs and merges partials with the same rescale.
+        in my own vLLM trace: 28 split-KV kernels and 28 combine kernels per
+        step, one pair per layer, at 14.9 to 16.2 us each.</pre>
+
+<h3>20.2 Anchor 2: the KV-cache OOM</h3>
+<pre>SETUP   I wanted to watch the KV cache kill a GPU rather than compute that it
+        would. Qwen2.5-1.5B fp16 on a 12GB RTX 3060, 32-token prompt, context
+        grown purely by decoding one token at a time, VRAM logged every 1000.
+        six hours of sequential decode. it died at 123,565 tokens.
+
+MATH    analytical: 2 x 28 layers x 2 KV heads x 128 head_dim x 2 bytes
+                  = 28,672 B = 28 KiB/token.
+        the 2 KV heads size the cache, not the 12 query heads. that is GQA.
+
+GAP     measured slope was 62 KiB/token, 2.21x the prediction, and sat above
+        it the whole way. that gap is a MECHANISM, not overhead:
+        HuggingFace reallocates the whole cache every step. torch.cat cannot
+        grow a tensor in place, so it allocates a fresh block for n+1 tokens
+        and copies n in, and both copies are live during the copy. peak is
+        weights + 2 x KV. at 120k that predicts 9507 MiB; I measured 10,227,
+        the ~700 MiB residual being attention scratch that also grows with n.
+
+CRASH   and the death is FRAGMENTATION, not exhaustion. at OOM: 10,437 MiB
+        allocated, 11,764 MiB reserved. 1.3 GiB free inside PyTorch's own
+        pool and unusable, because the next cat needed one contiguous 2 x KV
+        slab and the free space was scattered between parked blocks. enough
+        empty parking spaces for the bus, no unbroken stretch to fit it.
+
+OWN IT  I predicted the card would die near 30k tokens and kept the wrong
+        guess in the writeup. it reached 123k. the mechanism I named was
+        right and my arithmetic was pessimistic.
+
+LAND    both mechanisms are exactly what PagedAttention removes: fixed-size
+        blocks with a block table, so there is no cat, no second copy, and
+        any freed block fits any future need. that is the paper's "external
+        fragmentation" category, and I watched it before I read the name.</pre>
+
+<h3>20.3 Anchor 3: the batching knee</h3>
+<pre>WHY     batch 1 wastes the GPU: the step reads all 3.09 GB of weights to
+        advance one sequence by one token. intensity ~1, tensor cores idle.
+        so I swept vLLM concurrency 1 to 256 on the same 512-token prompt.
+
+WHAT    decode throughput 88.6 -> 2696 tok/s from batch 1 to 64, a 30x gain,
+        then essentially stopped: 2967 at batch 256, while TPOT climbed
+        11.28 -> 86.29 ms. the knee is 64.
+
+MODEL   step = T_fixed + c1 x batch. T_fixed ~ 11 ms is the shared weight
+        read paid once regardless of batch; c1 ~ 0.20 ms is what each added
+        sequence costs. throughput = batch / (T_fixed + c1 x batch): linear
+        while the fixed cost dominates, asymptotic to 1/c1 ~ 3000 once it
+        does not. knee where they cross: ~58 predicted, 64 measured.
+
+TWIST   the plateau is not a roofline. at batch 256 I am at ~9 TFLOPS (16%
+        of ~51) and ~90 GB/s (25% of 360). neither is saturated. the limit
+        is operation shape: batched decode is a skinny GEMM with M = batch,
+        occupancy-bound, and the paged KV reads are scattered. the naive
+        roofline predicts an ideal batch of 142 against a measured 64, and
+        that 2x-4x gap is itself the result.
+
+TEST    I made it falsifiable. I predicted the knee is a model property, not
+        a card property, because it is the weight-read-versus-KV-read
+        crossover. on an RTX 3090, 2.6x bandwidth and 1.4x compute, every
+        throughput number scaled 2.4x-3.4x and the knee stayed at 64, TPOT
+        flat through 64 and breaking at 96 on both cards. I got the plateau
+        HEIGHT wrong: predicted 6-7k from bandwidth alone, measured 10,100,
+        because the 3090's extra compute also lifts the skinny-GEMM ceiling.</pre>
+
+<h3>20.4 Anchor 4: the HF-versus-vLLM profiling result</h3>
+<pre>CLAIM   vLLM decodes ~3.2x faster than HuggingFace at batch 1, same card,
+        same model. the usual explanation is "CUDA graphs and fused kernels",
+        which is an argument, not a measurement. so I profiled it as a 2x2
+        ablation over torch.compile and CUDA-graph capture, plus HF.
+
+HEAD    of the 28.09 ms per token separating them, 25.34 ms (90%) is device
+        idle removed and 2.60 ms (9%) is faster device work. the gap is a
+        SCHEDULING problem, and now there is a number behind that sentence.
+        HF fires 1198 kernels with 1198 CPU launches and is 62.3% idle.
+        per-launch idle is only 21.1 us against a 12.8 us average kernel: it
+        is not that a launch is expensive, it is that it is paid 1198 times,
+        and batch-1 decode kernels are microsecond matrix-vector products,
+        so the dispatch chain above a kernel costs more than the kernel.
+
+SPLIT   the ablation separated two things the usual story conflates.
+        FUSION is vLLM's hand-written kernels, before any compiler runs:
+        with compile and graphs off on both sides, kernel count falls
+        1198 -> 356, a 3.4x cut. fused RMSNorm, fused rotary, fused
+        SiLU-and-multiply, paged FlashAttention.
+        CUDA GRAPHS change no kernels at all: counts are identical with
+        graphs on and off, but CPU launches fall 356 -> 17 and idle goes to
+        zero. I stated the prediction first: if graphs remove idle and
+        nothing else, the graphs-on step should equal the graphs-off busy
+        time. predicted 13.02 and 12.90 ms, measured 12.57 and 12.56.
+        within 3.5% and 2.6%.
+
+BEST    the result I did not predict is the most useful: the two are NOT
+        additive. torch.compile saves 2.81 ms with graphs off and 0.01 ms
+        with graphs on. once graphs take the CPU off the critical path,
+        making the CPU's per-launch work cheaper is worth nothing. measuring
+        only the shipping default against plain eager would have credited
+        graphs with a fusion win, or the reverse, with no way to tell.
+
+NEXT    and it closes the question of what is left. against this card's
+        MEASURED achievable read bandwidth of 291.5 GB/s, not the 360 GB/s
+        spec figure, vLLM's decode step runs at 85%. there is almost nothing
+        left to win from scheduling at batch 1. the next lever has to be
+        arithmetic intensity, which is the batching experiment.</pre>
+
+<h3>20.5 The routing table: which anchor answers which question</h3>
+<table>
+<tr><th>If asked</th><th>Route to</th></tr>
+<tr><td>"Walk me through a memory problem you debugged"</td><td>Anchor 2, in full</td></tr>
+<tr><td>"Explain FlashAttention" / "why is attention slow"</td><td>Anchor 1, in full</td></tr>
+<tr><td>"How would you pick a batch size" / "what is throughput vs latency"</td><td>Anchor 3, then
+Day 13's goodput and TTFT argument</td></tr>
+<tr><td>"Why is vLLM faster than transformers"</td><td>Anchor 4, in full</td></tr>
+<tr><td>"What is PagedAttention"</td><td>Anchor 2's crash, then the block table as its removal</td></tr>
+<tr><td>"Why is decode memory-bound"</td><td>Anchor 3's opening, then the 150x prefill-decode gap</td></tr>
+<tr><td>"Tell me about quantization"</td><td>Day 16's NF4 result, which routes into Anchor 4 for the
+62.3%-idle explanation</td></tr>
+<tr><td>"What would you do next on this work"</td><td>Anchor 4's closing: scheduling is at 85% of
+achievable bandwidth, so the remaining lever is arithmetic intensity</td></tr>
+</table>
+
+<!-- ===================== DAY 21 ===================== -->
+<h2 class="day">Day 21 &nbsp;&middot;&nbsp; Buffer, and what you are deliberately not learning</h2>
+
+<h3>21.1 Use the buffer on the gap Day 19 exposed</h3>
+<p>Day 19's table had two rows whose third column was not a measurement, and probably one or two more
+whose second column could not be reproduced cold. Spend the buffer there. Do not spend it on a new
+topic. Three weeks buys depth on ten layers or a mention of twenty, and the second option loses every
+follow-up question.</p>
+
+<h3>21.2 The deprioritization list, said confidently</h3>
+<p>Naming these is a positive signal. "Aware of it, have not gone deep" is a correct and
+well-calibrated answer. Hedging or bluffing is not.</p>
+<table>
+<tr><th>Cut</th><th>The reason, in the form to say it</th></tr>
+<tr><td>MoE routing and expert parallelism</td><td>"Single-GPU dense-model artifact. Everything I
+measured is about weight-read amortisation, which MoE changes qualitatively. I would rather be
+precise about dense inference than vague about both."</td></tr>
+<tr><td>Ring attention, sequence parallelism</td><td>"Multi-GPU long-context technique. I have one
+card, and my long-context result is a memory result, not a distribution result."</td></tr>
+<tr><td>FP8 and FlashAttention-3</td><td>"Hopper-class features. My card is Ampere sm_86. I could
+recite them but not measure them, and reciting is the failure mode I am avoiding."</td></tr>
+<tr><td>MLA beyond one sentence</td><td>"One sentence is enough: it compresses K and V into a shared
+low-rank latent, so it attacks the same KV-bytes term as GQA but harder. I can place it on the
+MHA-MQA-GQA axis; I have not derived it."</td></tr>
+<tr><td>P/D disaggregation (DistServe, Mooncake)</td><td>"Multi-node serving architecture. I
+understand the motivation directly from my own data, since prefill is compute-bound at 4205 tok/s and
+decode is memory-bound at 28, so co-locating them means one phase always interferes with the other.
+I have not studied the systems."</td></tr>
+<tr><td>Structured decoding, multi-LoRA</td><td>"Serving features orthogonal to the performance
+question this artifact is about."</td></tr>
+<tr><td>Training-side anything: ZeRO, FSDP, activation checkpointing</td><td>"Out of scope by
+construction. Inference has no backward pass, no optimizer state and no gradient memory, which is
+exactly why the KV cache is the dominant growing tenant rather than activations."</td></tr>
+<tr><td>Writing a production CUDA kernel</td><td>"Three weeks buys diagnosis, not authorship.
+I can read a kernel and tell you why it is slow in coalescing, occupancy and shared-memory terms.
+Claiming authorship I cannot demonstrate is worse than claiming neither."</td></tr>
+</table>
+
+<h3>21.3 The habit that decides whether any of this worked</h3>
+<p>End every topic by explaining it out loud, unaided, in under 90 seconds. If you cannot, re-derive
+it from scratch rather than rereading. Rereading produces recognition; re-derivation produces
+defence, and only one of those survives being interrupted with "wait, why is it two KV heads and not
+twelve?"</p>
+<p>The measure of a day is not what you read. It is what you can now say cold.</p>
+
+<h3>21.4 Final checklist, all three weeks</h3>
+<ol class="tight">
+<li>Whiteboard attention shapes through one decode step of this config, unaided.</li>
+<li>State the ridge point (142 FLOP/byte), where decode sits (intensity ~1), and where prefill sits.</li>
+<li>Hand over two versions of a matmul kernel and explain which is faster, in coalescing,
+shared-versus-global and occupancy terms, with numbers.</li>
+<li>Derive the online-softmax rescale on a blank page and verify it against a direct computation.</li>
+<li>Say why FlashAttention does nothing at batch-1 decode, and what does instead.</li>
+<li>Tell the OOM story in under 90 seconds with four numbers in it.</li>
+<li>Name both batching plateaus, their values, and the distinct mechanism behind each.</li>
+<li>Give the idle-versus-kernel split of the vLLM win, and why the two optimizations are not
+additive.</li>
+<li>Explain why your 4-bit run got slower, and name the two assumptions that would have to change.</li>
+<li>Deliver all four anchor answers cold, timed, and interrupted.</li>
+</ol>
+
+<div class="key"><b>The last thing to remember.</b> The strongest material in this repo is not the
+speedups. It is the three places where a prediction failed and was diagnosed: the OOM cliff came at
+123k tokens rather than the 30k predicted, the 3090 plateau came in at 10,100 tok/s rather than the
+6-7k predicted, and the 4-bit run got slower rather than faster. Lead with those when asked what you
+learned. Anyone can report a number that confirmed what they expected.</div>
+
+<p class="links"><b>Sources:</b>
+<a href="https://lilianweng.github.io/posts/2023-01-10-inference-optimization/">Weng, Large Transformer Model Inference Optimization</a> &middot;
+<a href="https://github.com/pytorch-labs/gpt-fast">gpt-fast (about 1000 lines that do everything the profiling result says matters)</a> &middot;
+<a href="https://arxiv.org/abs/2211.05102">Pope et al., Efficiently Scaling Transformer Inference</a> &middot;
+<a href="https://arxiv.org/abs/2312.07104">Zheng et al., SGLang / RadixAttention</a></p>
+
+<hr>
+<p class="small">Repo sources for every measured number above:
+<code>results/baseline_hf.csv</code>, <code>results/baseline_vllm.csv</code>,
+<code>results/profile_summary.csv</code>, <code>results/oom_sweep.csv</code>,
+<code>results/vllm_batch_sweep.csv</code>, <code>results/trace_vllm-graph.json.gz</code>,
+<code>docs/profiling.md</code>, <code>docs/batching-results.md</code>,
+<code>docs/oom-results.md</code>. The speculative-decoding figures in Day 17 and the
+tensor-parallelism figures in Day 18 are <b>projections</b> from the measured
+<code>T_fixed</code> and <code>c1</code> constants, not measurements, and are labelled as such where
+they appear. The four discrepancies listed in Day 18 are live in the repo as of this writing; the
+day's deliverable is the commit that closes them. Where a CSV and a prose doc disagree, the CSV is
+used.</p>
