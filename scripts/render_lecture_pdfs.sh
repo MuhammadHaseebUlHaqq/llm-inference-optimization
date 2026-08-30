@@ -7,7 +7,7 @@
 # skipped, so the PDFs drift from the sources. This does it in one command.
 #
 # Usage, from the repo root:
-#   bash scripts/render_lecture_pdfs.sh            # render all three
+#   bash scripts/render_lecture_pdfs.sh            # render all five
 #   bash scripts/render_lecture_pdfs.sh day9-12    # render one, by source stem
 #
 # Page geometry (A4, margins, font sizes) lives in the @page and body rules at
@@ -25,6 +25,8 @@ targets=(
   "week1_day1-4_condensed:WEEK1_DAY1-4_condensed.pdf"
   "week1_day5-8_condensed:WEEK1_DAY5-8_condensed.pdf"
   "week1_day9-12_condensed:DAY9-12_condensed.pdf"
+  "day13-16_condensed:DAY13-16_condensed.pdf"
+  "day17-21_condensed:DAY17-21_condensed.pdf"
 )
 
 find_chrome() {
