@@ -48,9 +48,12 @@ The repo also carries the written side of the phase, which is half the artifact:
 | `WEEK1_DAY1-4_condensed.pdf` | condensed lecture notes, days 1-4 |
 | `WEEK1_DAY5-8_condensed.pdf` | condensed lecture notes, days 5-8 |
 | `DAY9-12_condensed.pdf` | condensed lecture notes, days 9-12 |
+| `DAY13-16_condensed.pdf` | condensed lecture notes, days 13-16 |
+| `DAY17-21_condensed.pdf` | condensed lecture notes, days 17-21 |
 
-HTML sources for the PDFs live in `docs/lecture-src/` so they can be re-rendered
-rather than rewritten.
+The five condensed PDFs cover all 21 days of the roadmap. HTML sources live in
+`docs/lecture-src/` so they can be re-rendered rather than rewritten, with
+`scripts/render_lecture_pdfs.sh`.
 
 ## Hardware
 
