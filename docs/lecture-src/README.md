@@ -8,10 +8,14 @@ edited and re-rendered instead of rewritten.
 | `week1_day1-4_condensed.html` | `WEEK1_DAY1-4_condensed.pdf` (10 pages) |
 | `week1_day5-8_condensed.html` | `WEEK1_DAY5-8_condensed.pdf` (9 pages) |
 | `week1_day9-12_condensed.html` | `DAY9-12_condensed.pdf` (9 pages) |
+| `day13-16_condensed.html` | `DAY13-16_condensed.pdf` (10 pages) |
+| `day17-21_condensed.html` | `DAY17-21_condensed.pdf` (12 pages) |
 
 Day numbering is continuous across the 3-week roadmap, so it does not match the
 per-week numbering in `ROADMAP_3week_interview_prep.pdf`. Days 1-7 are Week 1,
-Day 8 onward is Week 2. That is why the Days 9-12 PDF has no week prefix.
+days 8-14 are Week 2, days 15-21 are Week 3. That is why the files past day 8
+carry no week prefix. Day 21 is the last day of the roadmap, so the final PDF
+covers five days rather than four.
 
 Measured numbers in these documents come from `results/*.csv`. Where a CSV and a
 prose doc in `docs/` disagree, the CSV wins. Which script wrote which CSV is in
@@ -20,7 +24,7 @@ prose doc in `docs/` disagree, the CSV wins. Which script wrote which CSV is in
 Render with `scripts/render_lecture_pdfs.sh`, from the repo root:
 
 ```
-bash scripts/render_lecture_pdfs.sh              # all three
+bash scripts/render_lecture_pdfs.sh              # all five
 bash scripts/render_lecture_pdfs.sh day9-12      # one, matched on the source stem
 ```
 
