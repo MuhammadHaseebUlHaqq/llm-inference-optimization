@@ -47,7 +47,10 @@ Two rules this harness follows, both learned the hard way in docs/profiling.md:
   before/after split across boxes would be meaningless.
 - The bimodality claim is a run-length effect, so it is tested by varying run
   length at a fixed rate and repeating, not by a single pair of runs. A single
-  pair cannot separate a real bistability from ordinary variance.
+  pair cannot separate a real bistability from ordinary variance. Pick the rate
+  from the sweep, near where the two configs actually diverge. A rate chosen
+  naively as "just above the ceiling" can land past saturation, where both
+  configs are queue-bound and the test measures queue growth instead.
 
 Usage (on the GPU box, inside the SGLang environment):
 
@@ -88,6 +91,9 @@ class CliffResult:
     cuda_graph_max_bs: int  # what the server actually captured up to
     capture_bs_list: str    # the full capture list, as logged
     max_running_requests: int  # the other half of the effective ceiling
+    max_total_num_tokens: int  # KV pool size, where widening is actually paid for
+    graph_capture_mib: float   # graph buffers, from the capture end line
+    graph_capture_seconds: float  # capture time, the other half of the cost
     request_rate: float
     num_prompts: int
     repeat: int
@@ -255,6 +261,39 @@ class Server:
         bs = self.capture_bs()
         return max(bs) if bs else -1
 
+    def resolved_max_total_num_tokens(self) -> int:
+        """KV pool size in tokens, logged by managers/scheduler.py.
+
+        This is where widening the graph coverage is actually paid for, and
+        leaving it out of the CSV is what made the first run of this experiment
+        report "widening was free". It is not free: mem_fraction_static derives
+        from reserved_mem = chunked_prefill_size * 1.5 + max_bs * 2, so a larger
+        max_bs shrinks the pool by roughly the amount the graph buffers grow and
+        the total footprint stays flat. Diffing total VRAM alone sees nothing.
+        """
+        m = re.search(r"max_total_num_tokens=(\d+)", self._log_text())
+        return int(m.group(1)) if m else -1
+
+    def graph_capture_cost(self) -> tuple[float, float]:
+        """(MiB, seconds) spent capturing decode graphs, from the capture end line:
+
+            Capture target decode CUDA graph end. elapsed=2.19 s,
+            mem usage=0.13 GB, avail mem=5.07 GB.
+
+        This is the direct measurement of what wider coverage costs, and it is
+        the number to check the tree's own (max_bs * 2) MB prediction against.
+        """
+        for line in self._log_text().splitlines():
+            if "Capture" not in line or "decode" not in line or "end" not in line:
+                continue
+            if "draft" in line:
+                continue
+            mem = re.search(r"mem usage=([0-9.]+) GB", line)
+            sec = re.search(r"elapsed=([0-9.]+) s", line)
+            if mem and sec:
+                return float(mem.group(1)) * 1024.0, float(sec.group(1))
+        return float("nan"), float("nan")
+
     def resolved_max_running_requests(self) -> int:
         """max_running_requests as the scheduler resolved it.
 
@@ -328,6 +367,9 @@ def record(args, server: Server, config: str, rate: float, n: int, repeat: int,
         cuda_graph_max_bs=server.resolved_max_bs(),
         capture_bs_list=" ".join(str(b) for b in server.capture_bs()),
         max_running_requests=server.resolved_max_running_requests(),
+        max_total_num_tokens=server.resolved_max_total_num_tokens(),
+        graph_capture_mib=server.graph_capture_cost()[0],
+        graph_capture_seconds=server.graph_capture_cost()[1],
         request_rate=rate,
         num_prompts=n,
         repeat=repeat,

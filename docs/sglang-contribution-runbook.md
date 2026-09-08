@@ -248,11 +248,25 @@ Four questions, in order:
    against `max_running_requests` on every row. If they are equal and small, you
    measured the clamp, not the ladder, and the run needs redoing with a larger
    pool.
-3. **What did the wider coverage cost?** `vram_after_ready_mib` and
-   `startup_seconds`, wide minus default. Check it against the tree's own
-   prediction of `(128 - 48) * 2 = 160` MB. If the prediction holds on a second
-   card too, that is a genuinely useful result for the PR.
-4. **Is the bimodality real?** Real bistability means short runs stay fast and long
+3. **What did the wider coverage cost?** Do **not** answer this with
+   `vram_after_ready_mib` alone. It will show roughly zero and you will conclude
+   the widening was free. It is not: `mem_fraction_static` derives from
+   `reserved_mem = chunked_prefill_size * 1.5 + max_bs * 2`, so a larger `max_bs`
+   shrinks the KV pool by about what the graph buffers gain, and the total
+   footprint stays flat by construction.
+
+   Diff `max_total_num_tokens` and `graph_capture_mib` instead. On the 4090 run
+   that gave a KV pool shrinking by 14,110 tokens (165.4 MiB at 12,288 B/token)
+   against graph buffers growing 143.4 MiB, versus the tree's predicted
+   `(128 - 48) * 2 = 160` MB. The prediction is accurate; the cost is just paid
+   in KV capacity and 0.5 s of capture time rather than VRAM.
+4. **Is the bimodality real?** Pick the rate from the sweep first, near where the
+   two configs actually diverge. Choosing it naively as "just above the ceiling"
+   can land past saturation, where both configs are queue-bound and you measure
+   queue growth instead of bistability. That is what happened on the 4090 run:
+   rate 62 was chosen before the sweep showed divergence at 32.
+
+   Real bistability means short runs stay fast and long
    runs stay slow across all three repeats. A warmup transient means the long-run
    medians land between the two extremes with wide spread across repeats. Say which
    one you saw. "The bimodality did not reproduce" is a perfectly good finding and
@@ -281,11 +295,22 @@ once, politely, with the reproduction attached.
 
 ## Step 7: the PR
 
-Scope it to the **startup warning** first: warn when the resolved decode capture
-ceiling is far below the batch the KV pool can actually sustain. It runs after pool
-allocation, where the reachable batch is actually known, so it sidesteps the
-circularity in deriving `max_bs` from the pool, and it is small enough to review in
-one pass. Changing the ladder heuristic is a second PR.
+**The startup warning is already taken.** PR #33900, "Warn once when decode batch
+exceeds the largest captured CUDA graph shape", was opened by KeMaSF on
+2026-08-06 and has sat with zero comments and zero reviews since. Do not write a
+competing one. If you want that change to land, the useful contribution is
+getting eyes on #33900, which is what the 4090 comment asks for.
+
+That leaves the ladder heuristic itself, direction 3 in the issue: make the choice
+account for the reachable batch, or at least model size, rather than device memory
+alone. It is a bigger change than the warning and it has the circularity problem
+(`max_bs` is fixed before the KV pool exists, so it cannot simply be derived from
+the pool). Do not start it without a maintainer saying they want it. The 4090
+measurement is the argument for it, and #37898 shows the ladder is actively
+maintained, so there is someone to ask.
+
+If a maintainer does invite the change, scope the first PR narrowly and keep the
+heuristic change separate from any refactor.
 
 ```bash
 cd /workspace/sglang
@@ -316,6 +341,32 @@ git push origin warn-cuda-graph-coverage
 Open the PR against `sgl-project/sglang` `main` and link the issue with
 "Closes #33483" only if the PR fully closes it, which the warning alone does not.
 Use "Refs #33483" instead.
+
+## What the 4090 run actually found
+
+Run of 2026-09-08, sglang `main` @ `141febf3` (includes #37898), RTX 4090 24GB,
+Qwen2.5-0.5B-Instruct, tp=1. Raw data in `results/sglang_cliff.csv`, server logs
+in `logs/sglang_cliff/`.
+
+The ladder resolved to `max_bs=48` with `max_running_requests=4096`, so the
+ceiling was the ladder and not the request pool. **The cliff reproduces on the
+raised rung**: at rate 32, median TPOT was 30.6 ms on the default against 5.3 ms
+with `--cuda-graph-max-bs-decode 128`, a 5.8x gap.
+
+Two results needed a second pass to read correctly, and both are the reason this
+runbook now says what it says:
+
+- **Above rate 48 the two configs reconverge.** Throughput plateaus near
+  9.7k tok/s in both, so past saturation TPOT is dominated by queueing and graph
+  coverage is masked. The cliff bites *below* saturation, which is the load region
+  operators actually run in. This is a stronger framing than "it diverges
+  everywhere", not a weaker one.
+- **Widening looked free and is not.** See Step 5 question 3.
+
+The bimodality did not reproduce: at rate 62, median TPOT rose monotonically with
+run length (31 -> 54 -> 82 ms) and was tight within each length. Given the sweep,
+62 was past saturation, so this measured queue growth rather than a second
+attractor. Reported as a null result.
 
 ## Step 8: capture it
 
