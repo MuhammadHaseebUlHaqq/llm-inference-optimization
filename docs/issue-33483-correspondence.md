@@ -22,10 +22,10 @@ Full text is in the issue thread.
 
 ---
 
-## Comment 2, follow-up (draft, not yet posted)
+## Comment 2, follow-up, posted 2026-09-08T14:05:28Z
 
 Corrects two of the three flagged items. Both turned out to be measurement or
-framing errors rather than real anomalies. Post as-is; it is plain markdown.
+framing errors rather than real anomalies. Posted verbatim as below.
 
 ---
 
@@ -101,6 +101,17 @@ https://github.com/MuhammadHaseebUlHaqq/llm-inference-optimization
 ## Open threads
 
 - Waiting on a maintainer reply about direction 3 (the ladder heuristic).
-  Ping once, politely, after about a week of silence.
+  Ping once, politely, after about a week of silence, so on or after
+  2026-09-15. No SGLang maintainer has replied to this issue since it was
+  filed on 2026-08-04, across four comments, so treat silence as the likely
+  outcome rather than a slight.
 - PR #33900 (KeMaSF's startup warning) is open with no review since 2026-08-06.
   Do not write a competing PR. Getting eyes on that one is the useful move.
+- Context for why a merge here is unlikely regardless of PR quality: as of
+  2026-09-08 SGLang carried 4,318 open pull requests, 2,446 of them older than
+  a month. A sample of 12 recent merges was 6 maintainers and 6 prior
+  contributors, no first-time authors, and the outside merges were vendor
+  hardware enablement (AMD gfx950, Intel XPU, NPU). Review capacity is the
+  bottleneck, not available work. The writeup in
+  blog/sglang-cuda-graph-cliff.md is the deliverable that does not depend on
+  anyone upstream.
