@@ -2,64 +2,124 @@
 
 Target: https://github.com/sgl-project/sglang/issues/33483
 
-The claim under test is that SGLang's default decode CUDA-graph coverage (`max_bs`)
-is chosen from device memory alone, so a small model on a large card gets graph
-coverage far below the batch it actually reaches, and decode falls off a cliff into
-eager execution above that batch.
+Verified against SGLang `main` at commit `ccfa120` (2026-09-08). The code moved
+since the first draft of this runbook, so if you are reading it much later,
+re-check the two file paths below before spending money on a box.
 
-The mechanism is already confirmed by reading the code (see "The diagnosis" below).
-What is missing from the issue, and what this runbook produces, is an independent
-reproduction on a different memory tier.
+The claim under test is that SGLang's default decode CUDA-graph coverage
+(`max_bs`) is chosen from device memory alone, so a small model on a large card
+gets graph coverage far below the batch it actually reaches, and decode falls off
+a cliff into eager execution above that batch.
 
-Budget: about 2 hours of GPU time, under $1 on a rented 4090.
+Budget: about 2 hours of GPU time on a rented 4090.
 
 ---
 
-## The diagnosis (already done, read this before you start)
+## What changed since this runbook was first written
 
-`ServerArgs._handle_gpu_memory_settings` in `python/sglang/srt/server_args.py`
-(around line 4602) picks decode `max_bs` from a ladder over device memory:
+Two things, and both matter.
 
-| device memory | chunked_prefill_size | decode max_bs (tp<4 / tp>=4) |
-| --- | --- | --- |
-| < 20 GB | 2048 | 8 |
-| < 35 GB | 2048 | **24 / 80** |
-| < 60 GB | 4096 | **32 / 160** |
-| < 90 GB | 8192 | 256 / 512 |
-| < 160 GB | 8192 | 256 / 512 |
-| else | 16384 | 512 |
+**1. The ladder moved file.** It used to be `ServerArgs._handle_gpu_memory_settings`
+in `python/sglang/srt/server_args.py`. The `arg_groups` refactor moved it to:
 
-Model size never enters. The reporter's L40 (46 GB) lands on the 32 rung. A 4090
-(24 GB) lands on the 24 rung. Both run a 0.5B model whose KV pool leaves room for a
-running batch in the hundreds.
+    python/sglang/srt/arg_groups/memory_hook.py, handle_gpu_memory_settings (line 27)
 
-Two supporting facts, both from the same file:
+**2. The rung this experiment targets was raised, five weeks after the issue was
+filed.** PR #37898 (commit `f3b2725`, merged 2026-09-04 by BBuf, a collaborator)
+raised the `<35GB` rung from `max_bs` 24 to 48, and `chunked_prefill_size` from
+2048 to 4096. Its stated reason, quoted from the source comment:
 
-- `reserve_for_graph_mb()` (line ~4877) charges `max_bs * 2` MB for graph buffers.
-  Widening 32 to 128 predicts 192 MB. The reporter measured 0.22 GB. The tree's own
-  cost model is already accurate here and already says the cost is small.
-- Deriving `max_bs` from the KV pool is circular as written:
-  `max_bs -> reserve_for_graph_mb -> mem_fraction_static -> KV pool -> reachable batch`.
-  `max_bs` is fixed before the pool exists. This is the reason the obvious fix is
-  not already in place, and any PR has to deal with it.
+> 32GB Blackwell (RTX 5090) can hold decode cuda graphs well past bs=24; the
+> previous cap forced eager decode at bs>=32 and collapsed high-concurrency
+> throughput vs vLLM.
+
+That PR does not reference issue #33483. It was justified entirely on Qwen3.5-9B,
+Qwen3.5-4B, Qwen2.5-VL-7B and gpt-oss-20b benchmarks against vLLM.
+
+This is good news, not bad. It means:
+
+- A 4090 now gets **48**, not 24. Any instruction telling you to expect 24 is stale.
+- The reporter's own rung (`<60GB`, the L40) is **untouched**. The filed bug is unfixed.
+- The raise was derived from 9B-and-larger models. **Model size still never enters
+  the ladder.** 48 is a better constant, not a fix.
+- There is now a named, active maintainer on this exact code path, which solves the
+  original problem with this plan: nobody had replied to the issue in five weeks.
+
+So the contribution is sharper than it was. It is no longer "24 is too low." It is:
+
+> You raised the `<35GB` rung to 48 using 9B-class models. Here is a 0.5B on that
+> same rung, on a 4090, still falling off the cliff, because the ladder is indexed
+> on device memory alone.
+
+---
+
+## The diagnosis (read this before you start)
+
+`handle_gpu_memory_settings` in `python/sglang/srt/arg_groups/memory_hook.py`
+(line 27) picks decode `max_bs` from a ladder over device memory:
+
+| device memory | chunked_prefill_size | decode max_bs (tp<4 / tp>=4) | cards |
+| --- | --- | --- | --- |
+| < 20 GB | 2048 | 8 | T4, 4080 |
+| < 35 GB | 4096 | **48 / 160** | A10, 4090, 5090. Raised from 24/80 by #37898 |
+| < 60 GB | 4096 | **32 / 160** | A100 40GB, L40. The reporter's rung, unchanged |
+| < 90 GB | 8192 | 256 / 512 | H100, A100 |
+| < 160 GB | 8192 | 256 / 512 | H20, H200 |
+| else | 16384 | 512 | B200, MI300 |
+
+Model size never enters. A 0.5B model and a 70B model on the same card get the
+same number, even though the 0.5B leaves far more KV pool and can therefore reach
+a much larger running batch.
+
+**The ladder is only half the ceiling.** In
+`python/sglang/srt/model_executor/runner/base_cuda_graph_runner.py`,
+`get_batch_sizes_to_capture` (line 64) clamps the capture list to
+`req_to_token_pool.size`, which comes from `max_running_requests`. So:
+
+    effective ceiling = min(ladder(device_memory), req_to_token_pool.size)
+
+This is worth knowing because a commenter on the issue reported
+`bs=[1, 2, 4, 8, 12, 14]` on a 5090 and attributed it to the ladder. It was not
+the ladder: their request pool cut the list to 14. If you conflate those two
+mechanisms in your issue comment, a maintainer who knows this code will discount
+everything else you wrote. The harness therefore reads **both** numbers back out
+of the server log and records them on every CSV row.
+
+One more supporting fact from `memory_hook.py`: the reserve model charges
+`chunked_prefill_size * 1.5 + max_bs * 2` MB for activations plus graph buffers.
+Widening 48 to 128 predicts `(128 - 48) * 2 = 160` MB. The reporter measured
+0.22 GB for their own widening. The tree's own cost model is already roughly
+accurate here and already says the cost is small. Checking that prediction on a
+second card is a cheap, genuinely useful result.
 
 ---
 
 ## Step 1: rent the box
 
-Vast.ai, on-demand, one GPU.
+Vast.ai, on-demand, one GPU. Add your SSH key at https://cloud.vast.ai/manage-keys/
+**before** you rent: Vast only injects account keys into new instances, so adding
+it afterwards locks you out of the box you just paid for.
 
-- **GPU: 1x RTX 4090 (24 GB).** Chosen deliberately: it sits on a *different* rung
-  (24) than the reporter's L40 (32). Reproducing on the same rung would only confirm
-  their number. Reproducing on a different rung shows the problem is the ladder
-  itself, not one badly chosen constant. That is a stronger contribution.
+- **GPU: 1x RTX 4090 (24 GB).** It sits on the `<35GB` rung, the one #37898 just
+  changed. That is now the point: you are testing a fresh maintainer-authored
+  constant with a model class its author did not test.
 - **Disk: at least 60 GB.** SGLang from source plus its wheels plus the model.
+  Disk is permanent on Vast and cannot be resized after creation.
+- **On-demand, not interruptible.** A preemption mid-sweep silently corrupts a
+  latency measurement.
 - **Image: an NVIDIA NGC PyTorch image**, same as the Phase 1 box.
+- Prefer high reliability score and high download bandwidth over the last cent of
+  price. A slow host turns a 15-minute setup into an hour of billed time, and a
+  host that drops you at minute 50 costs the whole sweep.
 - Note the exact GPU name, VRAM, driver, and CUDA version from `nvidia-smi`. You
   will quote them in the issue comment, and `docs/profiling.md` is the reminder of
   why: two nominally identical cards differed by 1.22x.
 
-Storage is billed while the instance is stopped. Destroy it when you are done.
+Raw DLPerf does not matter much here. Both configurations are measured on the same
+box in the same session, so absolute card speed cancels out of the comparison.
+
+Storage is billed while the instance is stopped. Destroy it when you are done, do
+not just stop it.
 
 ## Step 2: set up
 
@@ -86,10 +146,11 @@ git remote add upstream https://github.com/sgl-project/sglang.git
 
 Stay on `main`. The issue was filed against a `main` dev build, and the install
 docs pin an older release tag, which would put you on different code from the
-reporter.
+reporter. It would also put you *before* #37898, which is the change you are
+testing.
 
 Install from source. This is slower than `uv pip install sglang` but you need the
-source tree anyway to change `server_args.py`, and having two SGLangs installed is
+source tree anyway to change `memory_hook.py`, and having two SGLangs installed is
 a debugging trap you do not want.
 
 ```bash
@@ -106,13 +167,24 @@ Verify before benchmarking anything:
 
 ```bash
 python -c "import sglang; print(sglang.__version__)"
+git log -1 --format=%H                     # record the commit you are testing
+git merge-base --is-ancestor f3b2725 HEAD && echo "has #37898"
 python -m sglang.launch_server --model-path Qwen/Qwen2.5-0.5B-Instruct \
     --attention-backend flashinfer --port 30000
 ```
 
-Watch the startup log for the line reporting the CUDA-graph capture batch sizes.
-**On a 4090 it should show a ceiling of 24.** If it does not, the ladder has moved
-and every number below needs rechecking. Ctrl-C once you have seen it.
+Watch the startup log for two lines:
+
+```
+max_total_num_tokens=..., chunked_prefill_size=4096, ..., max_running_requests=..., ...
+Capture target decode CUDA graph begin. backend=full, num_tokens_per_req=1, bs=[..., 48], avail mem=... GB
+```
+
+**On a 4090 the capture list should top out at 48.** If it tops out at 24, your
+tree predates #37898 and you are on the wrong commit. If it tops out at something
+small and odd, read `max_running_requests` on the line above: the request pool is
+clamping you, not the ladder, and that changes what you are measuring. Either way,
+stop and work out which before running the sweep. Ctrl-C once you have seen it.
 
 ## Step 3: get this repo onto the box
 
@@ -134,40 +206,49 @@ cd /workspace/llm-inference-optimization
 python scripts/sglang_cudagraph_cliff.py --phase sweep
 ```
 
-This launches two servers in turn (default coverage, then `--cuda-graph-max-bs-decode 128`)
-and sweeps request rates 8 through 32 against each, twice. About one hour.
+This launches two servers in turn (default coverage, then
+`--cuda-graph-max-bs-decode 128`) and sweeps request rates 16 through 72 against
+each, twice. About one hour.
 
-What you are looking for: median TPOT roughly flat across rates on the wide config,
-and a sharp rise on the default config once the equilibrium running batch passes 24.
+The rates bracket a ceiling of **48**, not the 24 the old rung gave. What you are
+looking for: median TPOT roughly flat across rates on the wide config, and a sharp
+rise on the default config once the equilibrium running batch passes 48.
 
 ```bash
 python scripts/sglang_cudagraph_cliff.py --phase bimodality
 ```
 
-Fixed rate, three run lengths (500, 1000, 2000 prompts), three repeats each, all on
-the default configuration. About 20 minutes.
+Fixed rate (62, just above the ceiling), three run lengths (500, 1000, 2000
+prompts), three repeats each, all on the default configuration. About 20 minutes.
 
 **Do not shrink `--bimodal-prompts` to save time.** Run length is the independent
 variable of this phase. Shrinking it deletes the experiment.
 
 Both phases append to `results/sglang_cliff.csv`. Each row carries its own server
-startup time, VRAM after ready, and the capture ceiling read back out of the server
-log, so no row depends on you remembering which server it came from.
+startup time, VRAM after ready, the full capture list, and the resolved
+`max_running_requests`, so no row depends on you remembering which server it came
+from, and no row can confuse a ladder ceiling with a request-pool clamp.
 
 If a run dies, check `logs/sglang_cliff/server_*.log`. The most common failures are
 the port not being free from a previous run, and the model download timing out.
 
 ## Step 5: read the results honestly
 
-Three questions, in order:
+Four questions, in order:
 
-1. **Does the cliff reproduce on the 24 rung?** Compare median TPOT, default against
-   wide, at each rate. Report the rate at which they diverge.
-2. **What did the wider coverage cost?** `vram_after_ready_mib` and
-   `startup_seconds`, wide minus default. Check it against the tree's own prediction
-   of `(128 - 24) * 2 = 208` MB. If the prediction holds on a second card too, that
-   is a genuinely useful result for the PR.
-3. **Is the bimodality real?** Real bistability means short runs stay fast and long
+1. **Does the cliff still reproduce at 48?** Compare median TPOT, default against
+   wide, at each rate. Report the rate at which they diverge. If they never
+   diverge, #37898 accidentally covered the small-model case on this rung, and
+   that is a real finding you report as-is.
+2. **Was the ceiling the ladder or the request pool?** Check `cuda_graph_max_bs`
+   against `max_running_requests` on every row. If they are equal and small, you
+   measured the clamp, not the ladder, and the run needs redoing with a larger
+   pool.
+3. **What did the wider coverage cost?** `vram_after_ready_mib` and
+   `startup_seconds`, wide minus default. Check it against the tree's own
+   prediction of `(128 - 48) * 2 = 160` MB. If the prediction holds on a second
+   card too, that is a genuinely useful result for the PR.
+4. **Is the bimodality real?** Real bistability means short runs stay fast and long
    runs stay slow across all three repeats. A warmup transient means the long-run
    medians land between the two extremes with wide spread across repeats. Say which
    one you saw. "The bimodality did not reproduce" is a perfectly good finding and
@@ -178,22 +259,29 @@ reports a 1.4% anomaly it could not fully explain, and that is the standard here
 
 ## Step 6: comment on the issue
 
-Draft is in the scratchpad (`issue-33483-comment.md`); fill in the card name and
-your numbers. Post it from your own account.
+Write the comment fresh, against your actual numbers. It should do four things:
 
-The comment does three things: confirms the mechanism from the code, adds the cost
-number from a second card, and asks the maintainers which of the reporter's three
-options they want first. That last question is the point. It converts a cold PR
-into an invited one, and it is the step most first-time contributors skip.
+1. State the mechanism from the code, with the current file and line, and get the
+   ladder-versus-request-pool distinction right.
+2. Report the 4090 measurement on the post-#37898 rung.
+3. Note that #37898 raised this rung using 9B-class models only, and that model
+   size still does not enter the ladder.
+4. Ask which of the reporter's three options the maintainers want first.
 
-Then wait for a maintainer reply before writing code. If nobody answers in about a
-week, ping once, politely, with the reproduction attached.
+That last question is the point. It converts a cold PR into an invited one, and it
+is the step most first-time contributors skip.
+
+Address it to the thread, but be aware BBuf is the one who just touched this code.
+Then wait for a reply before writing code. If nobody answers in about a week, ping
+once, politely, with the reproduction attached.
 
 ## Step 7: the PR
 
-Scope it to the **startup warning** first. It runs after pool allocation, where the
-reachable batch is actually known, so it sidesteps the circularity entirely, and it
-is small enough to review in one pass. The heuristic change is a second PR.
+Scope it to the **startup warning** first: warn when the resolved decode capture
+ceiling is far below the batch the KV pool can actually sustain. It runs after pool
+allocation, where the reachable batch is actually known, so it sidesteps the
+circularity in deriving `max_bs` from the pool, and it is small enough to review in
+one pass. Changing the ladder heuristic is a second PR.
 
 ```bash
 cd /workspace/sglang

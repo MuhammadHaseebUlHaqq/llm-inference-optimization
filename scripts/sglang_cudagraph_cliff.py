@@ -4,25 +4,41 @@ https://github.com/sgl-project/sglang/issues/33483
 
 The claim, as filed against 1x L40 (46GB) with Qwen2.5-0.5B-Instruct: the default
 decode `max_bs` is 32, so every decode step at a running batch above 32 falls back
-to eager, and median TPOT goes from 3.38 ms to 13.00 ms. The reporter also saw
-bimodality, where the same request rate produced two different operating points
-depending only on how many prompts the run sent.
+to eager, and median TPOT goes from 3.38 ms to 13.00 ms.
 
-This script reproduces both claims on a different card, which is the part of the
-issue nobody has contributed yet.
+Since the issue was filed the ladder has moved once, which is the thing this
+harness now tests. PR #37898 (commit f3b2725, merged 2026-09-04 by BBuf, a
+collaborator) raised the <35GB rung from max_bs 24 to 48 and chunked_prefill_size
+from 2048 to 4096, citing an RTX 5090 (32GB) serving Qwen3.5-9B. The <60GB rung
+the original reporter sits on is untouched, and model size still never enters the
+ladder. So the open question is no longer "is 24 too low" but "is 48 still too low
+for a small model", which is exactly the original thesis re-aimed at a fresh,
+maintainer-authored constant.
 
-Where the default comes from, in SGLang main as of 2026-08-05:
+Where the ladder lives, in SGLang main as of 2026-09-08 (commit ccfa120):
 
-    python/sglang/srt/server_args.py, _handle_gpu_memory_settings (line ~4602)
+    python/sglang/srt/arg_groups/memory_hook.py, handle_gpu_memory_settings (line 27)
 
-It is a ladder over device memory alone, split once on tp_size:
+It moved out of server_args.py in the arg_groups refactor. It is a ladder over
+device memory alone, split once on tp_size:
 
-    <20GB -> 8      <35GB -> 24/80     <60GB -> 32/160
-    <90GB -> 256/512    <160GB -> 256/512    else -> 512
+    <20GB  -> max_bs 8
+    <35GB  -> max_bs 48/160    (A10, 4090, 5090)   <- raised from 24/80 by #37898
+    <60GB  -> max_bs 32/160    (A100 40GB, L40)    <- the reporter's rung
+    <90GB  -> max_bs 256/512
+    <160GB -> max_bs 256/512
+    else   -> max_bs 512
 
-Model size never enters. A 0.5B model and a 70B model on the same L40 both get 32,
-even though the 0.5B leaves tens of GB of KV pool and can therefore reach a running
-batch in the hundreds. That is the mechanism behind the cliff.
+The effective ceiling is not the ladder value alone. In
+model_executor/runner/base_cuda_graph_runner.py, get_batch_sizes_to_capture (line
+64) clamps the capture list to req_to_token_pool.size, which is derived from
+max_running_requests. So:
+
+    effective ceiling = min(ladder(device_memory), req_to_token_pool.size)
+
+That clamp is why a commenter on the issue saw bs=[1, 2, 4, 8, 12, 14] on a 5090:
+the ladder gave them a larger number and the request pool cut it to 14. Both
+quantities are therefore read back from the server log, never assumed.
 
 Two rules this harness follows, both learned the hard way in docs/profiling.md:
 
@@ -47,6 +63,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -69,6 +86,8 @@ class CliffResult:
 
     config: str            # "default" | "wide"
     cuda_graph_max_bs: int  # what the server actually captured up to
+    capture_bs_list: str    # the full capture list, as logged
+    max_running_requests: int  # the other half of the effective ceiling
     request_rate: float
     num_prompts: int
     repeat: int
@@ -200,25 +219,51 @@ class Server:
             time.sleep(1.0)
         raise RuntimeError(f"server not ready within {self.args.startup_timeout}s")
 
-    def resolved_max_bs(self) -> int:
-        """The capture ceiling the server actually chose, read back from its log.
-
-        Never trust the flag. When max_bs is left to the heuristic the whole point
-        is that its value is not obvious, and an unsupported combination can be
-        silently downgraded rather than rejected.
-        """
+    def _log_text(self) -> str:
         try:
             with open(self.log_path, errors="replace") as f:
-                text = f.read()
+                return f.read()
         except OSError:
-            return -1
-        marker = "max_bs"
-        for line in text.splitlines():
-            if marker in line and ("cuda_graph" in line or "CudaGraph" in line):
-                for token in line.replace("=", " ").replace(",", " ").split():
-                    if token.isdigit():
-                        return int(token)
-        return -1
+            return ""
+
+    def capture_bs(self) -> list[int]:
+        """The decode capture list the server actually built, read from its log.
+
+        Never trust the flag. The ladder value is only one half of the ceiling:
+        get_batch_sizes_to_capture also clamps the list to req_to_token_pool.size,
+        so the flag can be silently reduced. The log line is emitted by
+        model_runner_components/cuda_graph_setup.py and looks like:
+
+            Capture target decode CUDA graph begin. backend=full,
+            num_tokens_per_req=1, bs=[1, 2, 4, ...], avail mem=8.12 GB
+
+        The draft-worker line is skipped: speculative decoding is off here, but a
+        future run with it on would otherwise pick up the wrong list.
+        """
+        for line in self._log_text().splitlines():
+            if "Capture" not in line or "decode" not in line:
+                continue
+            if "draft" in line:
+                continue
+            m = re.search(r"bs=\[([0-9,\s]*)\]", line)
+            if m:
+                return [int(t) for t in m.group(1).split(",") if t.strip()]
+        return []
+
+    def resolved_max_bs(self) -> int:
+        """The top of the capture list, or -1 if the log did not report one."""
+        bs = self.capture_bs()
+        return max(bs) if bs else -1
+
+    def resolved_max_running_requests(self) -> int:
+        """max_running_requests as the scheduler resolved it.
+
+        Logged by managers/scheduler.py alongside max_total_num_tokens. It is the
+        other input to the effective ceiling, so a row that records only max_bs
+        cannot distinguish "the ladder chose this" from "the request pool cut it".
+        """
+        m = re.search(r"max_running_requests=(\d+)", self._log_text())
+        return int(m.group(1)) if m else -1
 
     def __exit__(self, *exc) -> None:
         if self.proc is not None and self.proc.poll() is None:
@@ -281,6 +326,8 @@ def record(args, server: Server, config: str, rate: float, n: int, repeat: int,
     result = CliffResult(
         config=config,
         cuda_graph_max_bs=server.resolved_max_bs(),
+        capture_bs_list=" ".join(str(b) for b in server.capture_bs()),
+        max_running_requests=server.resolved_max_running_requests(),
         request_rate=rate,
         num_prompts=n,
         repeat=repeat,
@@ -341,7 +388,8 @@ def phase_sweep(args) -> None:
     for config, max_bs in (("default", None), ("wide", args.wide_max_bs)):
         with Server(args, max_bs) as server:
             print(f"[phase] sweep, config={config}, captured up to "
-                  f"{server.resolved_max_bs()}")
+                  f"{server.resolved_max_bs()}, max_running_requests="
+                  f"{server.resolved_max_running_requests()}")
             for rate in args.rates:
                 for repeat in range(args.repeats):
                     record(args, server, config, rate, args.num_prompts, repeat)
@@ -350,7 +398,8 @@ def phase_sweep(args) -> None:
 def phase_bimodality(args) -> None:
     """Fixed rate, three run lengths, repeated, on the default configuration.
 
-    The issue reports 3.68 ms at n=500 and 12-13 ms at n>=1000 at the same rate.
+    The issue reports 3.68 ms at n=500 and 12-13 ms at n>=1000 at the same rate,
+    measured on the 32 rung. The rate here is scaled to the 48 rung instead.
     If that is real bistability, the short runs stay fast across repeats and the
     long runs stay slow. If it is a warmup transient being averaged away by short
     runs, the long-run median will sit between the two and the spread across
@@ -359,7 +408,8 @@ def phase_bimodality(args) -> None:
     """
     with Server(args, None) as server:
         print(f"[phase] bimodality at rate {args.bimodal_rate}, captured up to "
-              f"{server.resolved_max_bs()}")
+              f"{server.resolved_max_bs()}, max_running_requests="
+              f"{server.resolved_max_running_requests()}")
         for n in args.bimodal_prompts:
             for repeat in range(args.bimodal_repeats):
                 record(args, server, "default", args.bimodal_rate, n, repeat,
@@ -381,14 +431,19 @@ def main() -> None:
     p.add_argument("--output-len", type=int, default=256)
     p.add_argument("--warmup-requests", type=int, default=16)
 
+    # These bracket a ceiling of 48, not the 24 the <35GB rung used to give.
+    # The cliff shows up when the equilibrium running batch crosses the capture
+    # ceiling, so the rates have to push past 48 on a 24GB card, not past 32.
     p.add_argument("--rates", type=float, nargs="+",
-                   default=[8, 16, 20, 24, 28, 32],
+                   default=[16, 32, 48, 56, 64, 72],
                    help="request rates bracketing the cliff")
     p.add_argument("--num-prompts", type=int, default=1000)
     p.add_argument("--repeats", type=int, default=2)
     p.add_argument("--wide-max-bs", type=int, default=128)
 
-    p.add_argument("--bimodal-rate", type=float, default=31)
+    # Just above the 48 ceiling, mirroring the reporter's choice of a rate just
+    # above their own 32. Recheck this if the sweep puts the cliff elsewhere.
+    p.add_argument("--bimodal-rate", type=float, default=62)
     p.add_argument("--bimodal-prompts", type=int, nargs="+", default=[500, 1000, 2000])
     p.add_argument("--bimodal-repeats", type=int, default=3)
 
