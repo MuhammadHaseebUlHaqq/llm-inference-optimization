@@ -11,7 +11,11 @@ The claim under test is that SGLang's default decode CUDA-graph coverage
 gets graph coverage far below the batch it actually reaches, and decode falls off
 a cliff into eager execution above that batch.
 
-Budget: about 2 hours of GPU time on a rented 4090.
+Budget: about 2 hours of GPU time on a rented 4090, plus 30 to 60 minutes of
+billed setup (image pull, source install, weight download). At the typical
+on-demand 4090 rate of $0.35 to $0.50/hr that is roughly $1.00 to $1.75 for one
+clean pass. Storage is negligible while the instance runs and is the main way to
+waste money afterwards: 60 GB left stopped for a week costs about $2.
 
 ---
 
