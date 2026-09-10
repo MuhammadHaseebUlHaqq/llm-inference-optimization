@@ -1,0 +1,237 @@
+<meta charset="utf-8">
+<title>What I actually did in SGLang, in plain English</title>
+<style>
+@page { size: A4; margin: 14mm 15mm 14mm 15mm; }
+* { box-sizing: border-box; }
+body { font-family: "Charter", "Georgia", serif; font-size: 10.4pt; line-height: 1.42; color: #16181d; }
+h1 { font-size: 19pt; margin: 0 0 2px 0; line-height: 1.15; }
+h2 { font-size: 13pt; margin: 16px 0 6px 0; padding: 4px 0 4px 8px;
+     border-left: 4px solid #2b5fa8; background: #eef2f8; page-break-after: avoid; }
+h3 { font-size: 11pt; margin: 11px 0 4px 0; color: #1c3f70; page-break-after: avoid; }
+p { margin: 5px 0; }
+ul, ol { margin: 5px 0 5px 0; padding-left: 19px; }
+li { margin: 3px 0; }
+code, pre { font-family: "Consolas", "DejaVu Sans Mono", monospace; }
+code { font-size: 9pt; background: #f2f3f5; padding: 0 2px; border-radius: 2px; }
+pre { font-size: 8.6pt; background: #f7f8fa; border: 1px solid #dde1e8; border-radius: 3px;
+      padding: 6px 8px; margin: 6px 0; line-height: 1.32; white-space: pre-wrap;
+      page-break-inside: avoid; }
+table { border-collapse: collapse; width: 100%; margin: 6px 0; font-size: 9.2pt;
+        page-break-inside: avoid; }
+th, td { border: 1px solid #ccd2dc; padding: 3px 6px; text-align: left; vertical-align: top; }
+th { background: #eef2f8; font-weight: 600; }
+.sub { color: #55606f; font-size: 10pt; margin: 0 0 10px 0; }
+.ex { border: 1px solid #b9cbe4; background: #f4f8fd; border-radius: 3px;
+      padding: 6px 9px; margin: 7px 0; page-break-inside: avoid; }
+.ex .lbl { font-family: Consolas, monospace; font-size: 8.4pt; font-weight: 700;
+           letter-spacing: .04em; color: #2b5fa8; text-transform: uppercase; display: block;
+           margin-bottom: 3px; }
+.key { border-left: 3px solid #c58b00; background: #fdf7e8; padding: 5px 9px; margin: 7px 0;
+       page-break-inside: avoid; }
+.key b { color: #8a6100; }
+.warn { border-left: 3px solid #b3382c; background: #fdf0ee; padding: 5px 9px; margin: 7px 0;
+        page-break-inside: avoid; }
+.warn b { color: #8f2b21; }
+a { color: #2b5fa8; text-decoration: none; }
+.sec { page-break-before: always; }
+.small { font-size: 9pt; color: #55606f; }
+hr { border: 0; border-top: 1px solid #dde1e8; margin: 14px 0 0 0; }
+</style>
+
+<h1>What I actually did in SGLang</h1>
+<p class="sub">Plain English. What SGLang is, which part of it I touched, what I found, what I got
+wrong, and honestly whether it was any good. Written 2026-09-10, after the work was finished.</p>
+
+<h2>1 &nbsp;&middot;&nbsp; What SGLang is</h2>
+
+<p>SGLang is an <b>inference server</b> for large language models. It is the software a company runs
+so that many users can send prompts to one model at the same time and get answers back fast. vLLM is
+its main competitor. It is a big, serious project, backed by xAI, Oracle, LinkedIn and Cursor.</p>
+
+<p>Think of it as the difference between a home kitchen and a restaurant kitchen. Running a model in
+plain PyTorch is the home kitchen: one dish at a time, no rush. SGLang is the restaurant: hundreds of
+orders at once, and every second matters.</p>
+
+<h2>2 &nbsp;&middot;&nbsp; Which part of SGLang I worked on</h2>
+
+<p>I did <b>not</b> touch the model code, the maths kernels, or the core scheduler. I worked on the
+<b>startup configuration layer</b>: the code that runs once when the server boots and decides how to
+size things.</p>
+
+<p>Two files specifically:</p>
+
+<table>
+<tr><th>File</th><th>What it does</th></tr>
+<tr><td><code>arg_groups/memory_hook.py</code></td><td>Decides how large a batch of requests the
+server will pre-optimise for</td></tr>
+<tr><td><code>model_executor/runner/base_cuda_graph_runner.py</code></td><td>Builds the actual list of
+batch sizes, and cuts it down if the request pool is smaller</td></tr>
+</table>
+
+<div class="key"><b>One sentence for an interview.</b> "I worked on how SGLang chooses its decode
+CUDA-graph coverage at startup, and showed that the choice ignores model size."</div>
+
+<h2>3 &nbsp;&middot;&nbsp; The idea you need: pre-recorded checklists</h2>
+
+<p>Every time the GPU generates one token, the CPU has to issue hundreds of small commands to it.
+Issuing those commands takes time, and the GPU sits idle waiting for them.</p>
+
+<p>A <b>CUDA graph</b> is a fix for this. The server records the whole sequence of commands once,
+like writing down a checklist, and then replays the checklist instead of re-issuing every command.
+Much faster.</p>
+
+<p>But there is a catch. A checklist only works for the exact batch size it was recorded for. A
+checklist for 8 requests does not work for 9. So at startup SGLang records a set of checklists, for
+example for batch sizes 1, 2, 4, 8, 12, 16, 24, 32, 40, 48.</p>
+
+<div class="warn"><b>The failure.</b> If 60 requests arrive at once and the largest checklist is 48,
+there is no checklist to use. The server falls back to issuing every command by hand, one at a time.
+That is far slower. This is what people call falling off the cliff.</div>
+
+<h2>4 &nbsp;&middot;&nbsp; The actual bug</h2>
+
+<p>Here is the question: how does SGLang decide how many checklists to prepare?</p>
+
+<p><b>It looks at how much memory the GPU has. That is all.</b> A table in the code says: under 20 GB,
+prepare up to 8. Under 35 GB, prepare up to 48. Under 60 GB, prepare up to 32. And so on.</p>
+
+<p><b>The size of the model never enters the decision.</b> That is the bug.</p>
+
+<p>Why it matters: a small model leaves a lot of spare memory, and spare memory is what lets the
+server run many requests at once. So a small model on a big card can easily reach a batch of 100 or
+more, while its checklists stop at 48. A huge model on the same card can barely reach 10. Both get
+exactly the same checklists.</p>
+
+<div class="ex"><span class="lbl">Analogy</span>
+A restaurant decides how many pre-written recipe cards to prepare based only on the size of its
+kitchen, never on how quick the dish is. A kitchen serving instant noodles can handle 100 orders at
+once but only has cards for 48. Past 48, the chef improvises every order from scratch and everything
+slows to a crawl.</div>
+
+<h2 class="sec">5 &nbsp;&middot;&nbsp; What I did, step by step</h2>
+
+<ol>
+<li>Found a real open bug report about this, filed by someone else on an L40 GPU (issue #33483).</li>
+<li>Read the SGLang source myself and confirmed the mechanism, rather than trusting the report.</li>
+<li>Noticed something the report did not cover: <b>four days before my run</b>, a maintainer had
+raised the setting for my memory tier from 24 to 48. But they justified it using only large models
+(9 billion parameters and up). Nobody had checked a small model.</li>
+<li>Rented an RTX 4090 GPU on Vast.ai for about three hours.</li>
+<li>Ran a tiny model (0.5 billion parameters) two ways on the same card in the same session: once
+with the default 48, once forced to 128.</li>
+<li>Swept the request rate from 16 to 72 requests per second, two repeats at each point.</li>
+<li>Wrote the results up honestly, posted them publicly, and published the code, the raw data and
+the server logs so anyone can repeat it.</li>
+</ol>
+
+<div class="key"><b>Why same card, same session matters.</b> An earlier experiment in this repo found
+two supposedly identical GPUs differing by 1.22x in speed. If I had measured the two settings on two
+different rented machines, the comparison would have been meaningless.</div>
+
+<h2>6 &nbsp;&middot;&nbsp; What I found</h2>
+
+<p>The bug is real, and it survives the recent fix.</p>
+
+<table>
+<tr><th>Requests per second</th><th>Default (48)</th><th>Widened (128)</th><th>How much worse</th></tr>
+<tr><td>16</td><td>2.64 ms per token</td><td>2.63 ms</td><td>no difference</td></tr>
+<tr><td><b>32</b></td><td><b>30.57 ms per token</b></td><td><b>5.31 ms</b></td><td><b>5.76x slower</b></td></tr>
+<tr><td>48</td><td>40.99 ms</td><td>37.81 ms</td><td>almost none</td></tr>
+<tr><td>72</td><td>58.70 ms</td><td>59.41 ms</td><td>none</td></tr>
+</table>
+
+<p>At 32 requests per second the default setting was nearly <b>six times slower</b> per token. Same
+GPU, same model, same minute. The only difference was one configuration number.</p>
+
+<h2>7 &nbsp;&middot;&nbsp; The two things I got wrong, and caught</h2>
+
+<p>This is the part I would actually point at, more than the 5.76x.</p>
+
+<h3>Mistake 1: I said widening was free. It is not.</h3>
+<p>I compared total GPU memory used before and after, saw almost no difference, and concluded there
+was no cost. That was the wrong thing to measure. SGLang automatically shrinks its memory pool by
+roughly the amount the checklists grow, so the <b>total</b> can never change much. I was measuring
+the one number the system deliberately holds still.</p>
+<p>The real cost was <b>14,110 tokens of cache capacity</b>, about 1.1% of the pool, plus half a
+second of startup time. Once I measured the right variable, it matched SGLang's own internal
+prediction almost exactly.</p>
+
+<h3>Mistake 2: I thought the problem disappeared at high load.</h3>
+<p>The gap opened at 32 requests per second and closed again by 48, which looked like the effect had
+limits. It does not. Past 48 the GPU is simply <b>saturated</b>, maxed out at about 9,700 tokens per
+second either way, so everything is stuck waiting in a queue and the checklists cannot help.</p>
+<p>So the bug bites <b>below</b> saturation, which is exactly the load a real server runs at. That
+makes the finding more important, not less.</p>
+
+<div class="key"><b>Both corrections were posted publicly</b> on the same issue thread, with the data
+behind them, rather than quietly fixed.</div>
+
+<h2 class="sec">8 &nbsp;&middot;&nbsp; What I did NOT do</h2>
+
+<div class="warn"><b>I did not get code merged into SGLang.</b> There is no pull request of mine in
+the project. This should be said plainly and not dressed up.</div>
+
+<p>The plan was to submit a small fix that warns the operator when this happens. While preparing it,
+I found that <b>that exact fix already existed</b> as pull request #33900, written a month earlier by
+the person who filed the original bug report, and sitting completely unreviewed. Writing a competing
+one would have been wasted effort.</p>
+
+<p>So I looked at why it was unreviewed, and measured the project itself:</p>
+
+<table>
+<tr><th>Measurement, 2026-09-08</th><th>Value</th></tr>
+<tr><td>Open pull requests in SGLang</td><td>4,318</td></tr>
+<tr><td>Of those, older than one month</td><td>2,446</td></tr>
+<tr><td>First-time authors in a sample of 12 recent merges</td><td>0</td></tr>
+<tr><td>Unassigned issues I checked that already had a pull request</td><td>5 of 7</td></tr>
+</table>
+
+<p>The conclusion is uncomfortable but useful: <b>writing a good fix is not the hard part. Getting
+anyone to look at it is.</b> The outside contributions that do get merged are mostly from engineers
+at AMD, Intel and NPU vendors working on their own hardware, who already have relationships with the
+maintainers.</p>
+
+<h2>9 &nbsp;&middot;&nbsp; So was it good work, honestly?</h2>
+
+<p><b>Yes, with one clear limit.</b></p>
+
+<p>What is genuinely good:</p>
+<ul>
+<li>I read a real production system's source and understood a mechanism, rather than reading a blog
+post about it.</li>
+<li>I found an angle nobody else had: the setting had just been changed using only large models, and
+I tested the case its author did not.</li>
+<li>The experiment design is sound. Same card, same session, repeats, both configurations swept
+across the same rates.</li>
+<li>I caught two of my own errors and corrected them in public with data. Most people quietly fix
+mistakes or never notice them.</li>
+<li>Everything is reproducible: code, raw CSV, server logs, and a runbook, all published.</li>
+<li>The whole thing cost under $2.</li>
+</ul>
+
+<p>The limit: <b>this is a measurement, not a merged contribution.</b> If someone asks "have you
+contributed to open source," the honest answer today is "I published an independent reproduction of a
+bug in SGLang and it is on the public issue thread," not "I have code in SGLang."</p>
+
+<div class="key"><b>For MS applications this is arguably the better artifact anyway.</b> An admissions
+committee can read a blog post and a repository. They cannot read a pull request queue. What they are
+looking for is evidence that you can form a question, design a fair measurement, and report the
+result honestly including when it contradicts you. That is exactly what this shows.</div>
+
+<h2>10 &nbsp;&middot;&nbsp; Where everything lives</h2>
+
+<table>
+<tr><th>Thing</th><th>Where</th></tr>
+<tr><td>The write-up</td><td><code>blog/sglang-cuda-graph-cliff.md</code></td></tr>
+<tr><td>The measurement code</td><td><code>scripts/sglang_cudagraph_cliff.py</code></td></tr>
+<tr><td>Raw results</td><td><code>results/sglang_cliff.csv</code></td></tr>
+<tr><td>Server logs</td><td><code>logs/sglang_cliff/</code></td></tr>
+<tr><td>How to repeat it</td><td><code>docs/sglang-contribution-runbook.md</code></td></tr>
+<tr><td>What was said upstream</td><td><code>docs/issue-33483-correspondence.md</code></td></tr>
+<tr><td>The public thread</td><td>github.com/sgl-project/sglang/issues/33483</td></tr>
+</table>
+
+<hr>
+<p class="small">One open item: if no SGLang maintainer replies to the thread on or after
+2026-09-15, ping it once, politely. Nobody from the team has replied since the issue was filed on
+2026-08-04, across four comments, so expect silence rather than reading it as a rejection.</p>

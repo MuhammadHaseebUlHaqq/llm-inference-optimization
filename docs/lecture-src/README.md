@@ -10,6 +10,7 @@ edited and re-rendered instead of rewritten.
 | `week1_day9-12_condensed.html` | `DAY9-12_condensed.pdf` (9 pages) |
 | `day13-16_condensed.html` | `DAY13-16_condensed.pdf` (10 pages) |
 | `day17-21_condensed.html` | `DAY17-21_condensed.pdf` (12 pages) |
+| `sglang_contribution_explained.html` | `SGLANG_contribution_explained.pdf` (6 pages) |
 
 Day numbering is continuous across the 3-week roadmap, so it does not match the
 per-week numbering in `ROADMAP_3week_interview_prep.pdf`. Days 1-7 are Week 1,

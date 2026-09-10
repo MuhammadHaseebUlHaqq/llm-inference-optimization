@@ -27,6 +27,7 @@ targets=(
   "week1_day9-12_condensed:DAY9-12_condensed.pdf"
   "day13-16_condensed:DAY13-16_condensed.pdf"
   "day17-21_condensed:DAY17-21_condensed.pdf"
+  "sglang_contribution_explained:SGLANG_contribution_explained.pdf"
 )
 
 find_chrome() {
