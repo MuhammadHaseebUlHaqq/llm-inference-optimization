@@ -1,14 +1,18 @@
 # Week 5: consolidate, then clear the Phase 2 gate
 
+> **Correction, 2026-09-19.** The Part A items below were marked done and were
+> not. No notes were committed for them. The boxes are un-ticked again. The
+> Part B gate is still open and is now planned in `weeks/week7.md`.
+
 Budget for the LLM inference track this week is about 30 to 32 hours, all technical. This is the gate week: one consolidation lecture, close any remaining reference gaps, then the gate itself, read a kernel you did not write and explain why it is fast or slow in coalescing, shared-vs-global, and occupancy terms. If it lands clean, Phase 2 is done and you are about two weeks ahead of the mid-August nominal.
 
 ## Part A: consolidate, about 6 to 8 hours
 
-- [x] **GPU MODE lecture 8, CUDA Performance Checklist (about 3 hours).** The best single consolidation of everything Phase 2 tests: coalescing, occupancy, memory-vs-compute bound, and the usual ways a kernel leaves performance on the table. This is the checklist you will run in your head during Phase 3.
+- [ ] **GPU MODE lecture 8, CUDA Performance Checklist (about 3 hours).** The best single consolidation of everything Phase 2 tests: coalescing, occupancy, memory-vs-compute bound, and the usual ways a kernel leaves performance on the table. This is the checklist you will run in your head during Phase 3.
 
 - [ ] **GPU MODE lecture 9, parallel reduction, if time (about 2 hours).** Control divergence, memory divergence, minimizing global-memory access, and thread coarsening, shown on a reduction. Optional but high-value, these are the exact failure modes the gate asks you to name.
 
-- [x] **Close the PMPP chapter 4 to 6 gaps (about 2 hours).** Anything from last week's reference reading that is still fuzzy: the occupancy math, the tiling walk-through, the coalescing rules. Do not start new chapters.
+- [ ] **Close the PMPP chapter 4 to 6 gaps (about 2 hours).** Anything from last week's reference reading that is still fuzzy: the occupancy math, the tiling walk-through, the coalescing rules. Do not start new chapters.
 
 ## Part B: the gate, about 8 to 10 hours
 
