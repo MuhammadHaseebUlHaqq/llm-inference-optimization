@@ -1,6 +1,6 @@
 # Week 6: pay back the artifact debt, then close the Phase 2 gate
 
-Budget for the LLM inference track this week is about 30 hours. Weeks 4 and 5 delivered all of the input work and none of the output work: CS149 5 and 6, GPU MODE 2, 3, 4, 5 and 8, and the PMPP 4 to 6 reference pass are all done, but the repo has not gained a script, a doc, or a plot since 2026-07-03. The Phase 2 gate is still open because the gate was defined as writing and nothing is written.
+Budget for the LLM inference track this week is about 30 hours. Weeks 4 and 5 delivered all of the input work and none of the output work: CS149 5 and 6, GPU MODE 2, 3, 4, 5 and 8, and the PMPP 4 to 6 reference pass were all recorded as done, but the repo has not gained a script, a doc, or a plot since 2026-07-03. (Correction, 2026-09-19: the input work was not done either. See the notes at the top of `weeks/week4.md` and `weeks/week5.md`, and the replacement plan in `weeks/week7.md`.) The Phase 2 gate is still open because the gate was defined as writing and nothing is written.
 
 So this is not a new week of material. This is the missing half of the last two weeks, done properly. No new lectures. No Phase 3. No kernel writing.
 
