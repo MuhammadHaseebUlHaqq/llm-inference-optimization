@@ -37,12 +37,16 @@ So the input is about 6 hours, not 40. Lecture 5 below covers the tiling
 ground that PMPP chapter 5 was budgeted 4 hours for, which is where the rest of
 the saving comes from.
 
-## Block 1: the prerequisites, about 6 hours, 2026-09-19 to 2026-09-27
+## Block 1: the prerequisites, about 6 hours, 2026-10-06 to 2026-10-14
 
 > **Video links verified 2026-10-06.** The GPU MODE README carries no YouTube
 > links, so each video below was matched by fetching it and checking its title.
 > The lecture numbering comes from that README. Durations are from secondary
 > write-ups, not from YouTube, so treat them as approximate.
+>
+> **Dates reset 2026-10-06.** Block 1 had not started by the original
+> 2026-09-27, so both blocks and the checkpoint moved out by two and a half
+> weeks. Nothing about the content changed.
 
 Do these in order. Each one ends with notes committed to
 `docs/notes-phase2-gpu.md`, per the "no checkbox without a commit" rule.
@@ -90,7 +94,7 @@ GPU MODE Lecture 8, "CUDA Performance Checklist", Mark Saroufim,
 https://www.youtube.com/watch?v=SGhfUhlowB4. Save that one for after the gate is
 written, where it works better as a self-check than as input.
 
-## Block 2: write the gate, about 7 hours, 2026-09-28 to 2026-10-04
+## Block 2: write the gate, about 7 hours, 2026-10-15 to 2026-10-21
 
 One new file, `docs/gate-phase2.md`, two sections. No GPU needed: the traces are
 already committed and this runs on the laptop.
@@ -140,7 +144,7 @@ already committed and this runs on the laptop.
 - [ ] **One IELTS Writing Task 2 under timed conditions.** Forty minutes, no
       edits after. Tells you whether Writing needs weekly hours or almost none.
 
-## Checkpoint: done on 2026-10-04
+## Checkpoint: done on 2026-10-21
 
 Phase 2 closes, and Phase 3 (writing Triton kernels) opens, when all three hold:
 
@@ -149,6 +153,6 @@ Phase 2 closes, and Phase 3 (writing Triton kernels) opens, when all three hold:
    carries a number.
 3. `docs/profiling.md` is committed. Already true since 2026-08-27.
 
-If Block 1 slips, Block 2 slips with it and the checkpoint moves to 2026-10-11.
+If Block 1 slips, Block 2 slips with it and the checkpoint moves to 2026-10-28.
 Do not write the gate on top of skipped reading: a shaky gate makes Phase 3
 slower, not faster, which is the entire reason the gate exists.
