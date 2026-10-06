@@ -33,27 +33,40 @@ Only two real gaps remain:
    cooperatively, syncing, computing, and moving on. That walkthrough is the
    whole of the naive-vs-tiled comparison the gate asks for.
 
-So the input is about 10 hours, not 40.
+So the input is about 6 hours, not 40. Lecture 5 below covers the tiling
+ground that PMPP chapter 5 was budgeted 4 hours for, which is where the rest of
+the saving comes from.
 
-## Block 1: the prerequisites, about 10 hours, 2026-09-19 to 2026-09-27
+## Block 1: the prerequisites, about 6 hours, 2026-09-19 to 2026-09-27
+
+> **Video links verified 2026-10-06.** The GPU MODE README carries no YouTube
+> links, so each video below was matched by fetching it and checking its title.
+> The lecture numbering comes from that README. Durations are from secondary
+> write-ups, not from YouTube, so treat them as approximate.
 
 Do these in order. Each one ends with notes committed to
 `docs/notes-phase2-gpu.md`, per the "no checkbox without a commit" rule.
 
-- [ ] **Step 0, read CUDA code, about 3 hours.** Jeremy Howard, "Getting started
-      with CUDA for Python programmers", in the GPU MODE series. Index with
-      slides and code: https://github.com/gpu-mode/lectures (confirm the lecture
-      number from that README, the videos are on the GPU MODE YouTube channel).
-      It starts in Python and moves to CUDA C, assuming no CUDA background,
-      which is the right entry point coming from PyTorch. The alternative is
-      PMPP chapters 2 and 3, the same material as a book, slower and more
-      precise.
+- [ ] **Step 0, read CUDA code, about 1.5 hours.** GPU MODE Lecture 3,
+      "Getting Started With CUDA for Python Programmers", Jeremy Howard.
+      https://www.youtube.com/watch?v=nOxKexn3iBo (about 1h 17m)
+      Notebook: the `lecture_003` folder in https://github.com/gpu-mode/lectures
+      Starts with RGB to grayscale in pure Python, then the same kernel in CUDA,
+      so `threadIdx`, `blockIdx` and the launch config arrive attached to
+      something concrete. The book alternative is PMPP chapters 2 and 3, slower
+      and more precise.
       The goal is reading a kernel, not writing one.
 
-- [ ] **Step 1, tiling, about 4 hours.** PMPP (Hwu, Kirk, Hajj, 4th edition)
-      chapter 5, memory architecture and data locality. The tiled matmul
-      walkthrough, properly, pencil in hand. This closes gap 2 and is the single
-      highest-value read on the list.
+- [ ] **Step 1, tiling, about 1.5 hours.** GPU MODE Lecture 5, "Going Further
+      with CUDA for Python Programmers", Jeremy Howard.
+      https://www.youtube.com/watch?v=eUuGdh3nBGo (about 1h 5m)
+      Notebook in `lecture_005`. It assumes lecture 3 first, so keep the order.
+      Shared memory at 0:49, shared memory from Python at 12:00, dynamic shared
+      memory at 18:41.
+      This is the shared-memory tiled matmul built step by step, the same ground
+      as PMPP chapter 5 (memory architecture and data locality). Video first is
+      the better order with no prior CUDA reading. Read the chapter afterwards
+      only if the video version stays slippery.
 
 - [ ] **Step 2, the measured version, about 3 hours.** Simon Boehm, "How to
       Optimize a CUDA Matmul Kernel for cuBLAS-like Performance":
@@ -72,9 +85,10 @@ Do these in order. Each one ends with notes committed to
 
 PMPP chapters 4 and 6 (Day 3 already covers occupancy and coalescing to gate
 standard), CS149 entirely (general parallel computing, good context, not what
-the gate asks), and the GPU MODE performance checklist lecture. Save that last
-one for after the gate is written, where it works better as a self-check than as
-input.
+the gate asks), and the GPU MODE performance checklist lecture:
+GPU MODE Lecture 8, "CUDA Performance Checklist", Mark Saroufim,
+https://www.youtube.com/watch?v=SGhfUhlowB4. Save that one for after the gate is
+written, where it works better as a self-check than as input.
 
 ## Block 2: write the gate, about 7 hours, 2026-09-28 to 2026-10-04
 
